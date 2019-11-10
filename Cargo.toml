@@ -1,0 +1,5 @@
+[package]
+name = "devicetree"
+version = "0.0.1"
+authors = ["Chris Williams <diodesign@tuta.io>"]
+edition = "2018"
