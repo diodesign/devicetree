@@ -3,3 +3,7 @@ name = "devicetree"
 version = "0.0.1"
 authors = ["Chris Williams <diodesign@tuta.io>"]
 edition = "2018"
+
+[dependencies.hashbrown]
+version = "0.6.3"
+features = [ "nightly" ]
