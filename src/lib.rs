@@ -64,29 +64,10 @@ pub struct DeviceTreeBlob
     off_dt_strings: u32,
     off_mem_rsvmap: u32,
     version: u32,
-    last_comp_version: u32,
+     last_comp_version: u32,
     boot_cpuid_phys: u32,
     size_dt_strings: u32,
     size_dt_struct: u32
-}
-
-
-impl core::fmt::Debug for DeviceTreeBlob
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-    {
-        write!(f, "dtb base address:    {:p}\n", self);
-        write!(f, "magic:               0x{:x}\n", u32::from_be(self.magic));
-        write!(f, "totalsize:           0x{:x}\n", u32::from_be(self.totalsize));
-        write!(f, "off_dt_struct:       0x{:x}\n", u32::from_be(self.off_dt_struct));
-        write!(f, "off_dt_strings:      0x{:x}\n", u32::from_be(self.off_dt_strings));
-        write!(f, "off_mem_rsvmap:      0x{:x}\n", u32::from_be(self.off_mem_rsvmap));
-        write!(f, "version:             0x{:x}\n", u32::from_be(self.version));
-        write!(f, "last_comp_version:   0x{:x}\n", u32::from_be(self.last_comp_version));
-        write!(f, "boot_cpuid_phys:     0x{:x}\n", u32::from_be(self.boot_cpuid_phys));
-        write!(f, "size_dt_strings:     0x{:x}\n", u32::from_be(self.size_dt_strings));
-        write!(f, "size_dt_struct:      0x{:x}\n", u32::from_be(self.size_dt_struct))
-    }
 }
 
 impl DeviceTreeBlob
@@ -206,21 +187,51 @@ impl DeviceTreeBlob
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
-                /* skip offset past the length and string offset header, as well as the data */
+                /* skip offset past the string offset header, then either generate
+                an empty property or one with the property's data copied into it */
                 align_to_next_u32!(*offset);
-                *offset = *offset + length as usize;
-
-                /* don't forget to align to a boundary if necessary */
-                if is_aligned_u32!(*offset) == false
+                let value = match length
                 {
-                    align_to_next_u32!(*offset);
-                }
-                                
+                    0 => DeviceTreeProperty::Empty,
+                    _ =>
+                    {
+                        let mut array = Vec::<u8>::new();
+                        for _ in 0..length
+                        {
+                            if let Some(byte) = self.read_u8(*offset)
+                            {
+                                array.push(byte);
+                                align_to_next_u8!(*offset);
+                            }
+                            else
+                            {
+                                return Err(DeviceTreeError::ReachedUnexpectedEnd);
+                            }
+                        }
+
+                        /* don't forget to align to a boundary if necessary */
+                        if is_aligned_u32!(*offset) == false
+                        {
+                            align_to_next_u32!(*offset);
+                        }
+
+                        DeviceTreeProperty::Bytes(array)
+                    }
+                };
+
+                /* handle the special case of the root node being '/' */
+                let full_path = match current_parent_path.len()
+                {
+                    0 => String::new(),
+                    1 => String::from("/"),
+                    _ => current_parent_path.join("/")
+                };
+
                 return Ok(DeviceTreeBlobTokenParsed
                 {
-                    full_path: format!("{}", current_parent_path.join("/")),
+                    full_path: full_path,
                     property: self.get_string((string_offset + u32::from_be(self.off_dt_strings)) as usize),
-                    value: DeviceTreeProperty::Empty
+                    value: value
                 });
             },
 
@@ -256,6 +267,19 @@ impl DeviceTreeBlob
 
         let addr = self.get_base() + offset;
         Some(unsafe { core::ptr::read(addr as *const u32) })
+    }
+
+    /* read a byte at offset bytes from the base address of the blob
+    <= value read, or None for failure */
+    fn read_u8(&self, offset: usize) -> Option<u8>
+    {
+        if offset > u32::from_be(self.totalsize) as usize
+        {
+            return None; /* prevent reading beyond the end of the structure */
+        }
+
+        let addr = self.get_base() + offset;
+        Some(unsafe { core::ptr::read(addr as *const u8) })
     }
 
     /* return a copy of a null-terminated string at offset bytes from the base address of the blob */
@@ -301,16 +325,18 @@ struct DeviceTreeBlobTokenParsed
     value: DeviceTreeProperty
 }
 
+/* convert the contents of a property into various formats */
 #[derive(Clone, Debug)]
 pub enum DeviceTreeProperty
 {
     Empty,
-    Unsigned32(u32),
-    Unsigned64(u64),
-    Text(String),
-    Handle(u32),
-    Array(Vec<u32>),
-    Strings(Vec<String>)
+    Bytes(Vec<u8>),
+    Reg
+}
+
+impl DeviceTreeProperty
+{
+    // pub fn as_reg(&self) -> Vec()
 }
 
 /* parsed device tree */

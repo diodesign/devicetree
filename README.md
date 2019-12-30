@@ -2,7 +2,7 @@
 
 This is a simple crate for reading and writing device tree blobs (DTBs). This blob data is typically passed to a kernel or some other low-level code by a bootloader or firmware when a system is powered up. The device tree describes the underlying hardware, such as the location of physical memory and control registers for interfaces and timers, and so on.
 
-This crate is used by [Diosix](https://diosix.org) to boot a system, and to describe virtual hardware environments to guest operating systems. As such, it does not require the standard library. If you wish to use this for your own project, let me know and I'll tidy up the documentation and API.
+This crate is used by [Diosix](https://diosix.org) to boot a system, and to describe virtual hardware environments to guest operating systems. As such, it does not require the standard library. If you wish to use this for your own project, let me know and I'll tidy up the documentation and API, and add test coverage.
 
 ### Contact and code of conduct <a name="contact"></a>
 
