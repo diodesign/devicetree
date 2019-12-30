@@ -6,7 +6,7 @@
  * To write a device tree structure as a device tree blob, call DeviceTree::to_blob()
  * 
  * The parsed device tree is designed to be safely iterated over, searched, cloned, and
- * modified by Rust code.
+ * modified by Rust code. Note: This code ignores empty nodes with no properties - FIXME?
  * 
  * This does not require the standard library, but it does require a heap allocator.
  * 
@@ -18,20 +18,36 @@
 #![no_std]
 #![no_main]
 
+#[macro_use]
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::mem::{transmute};
 
 extern crate hashbrown;
 use hashbrown::hash_map::{HashMap, Iter};
 
-enum DeviceTreeBlobToken
+const LOWEST_SUPPORTED_VERSION: u32 = 16; 
+
+const FDT_BEGIN_NODE:   u32 = 0x00000001;
+const FDT_END_NODE:     u32 = 0x00000002;
+const FDT_PROP:         u32 = 0x00000003;
+const FDT_END:          u32 = 0x00000009;
+
+/* useful macros for rounding an address up to the next word boundaries */
+macro_rules! align_to_next_u32 { ($a:expr) => ($a = ($a & !3) + 4); }
+macro_rules! align_to_next_u8  { ($a:expr) => ($a = $a + 1);        }
+
+/* returns true if address is aligned to a 32-bit word boundary */
+macro_rules! is_aligned_u32    { ($a:expr) => (($a & 3) == 0);      }
+
+/* define parsing errors / results */
+pub enum DeviceTreeError
 {
-    FDT_BEGIN_NODE  = 0x00000001,
-    FDT_END_NODE    = 0x00000002,
-    FDT_PROP        = 0x00000003,
-    FDT_NOP         = 0x00000004,
-    FDT_END         = 0x00000009
+    FailedSanityCheck,
+    ReachedEnd,
+    TokenUnaligned,
+    SkippedToken
 }
 
 /* define the header for a raw device tree blob */
@@ -74,7 +90,7 @@ impl DeviceTreeBlob
     /* return true if this looks like legit DTB data, or false if not */
     pub fn sanity_check(&self) -> bool
     {
-        if u32::from_be(self.magic) != 0xd00dfeed
+        if u32::from_be(self.magic) != 0xd00dfeed || u32::from_be(self.last_comp_version) > LOWEST_SUPPORTED_VERSION
         {
             return false;
         }
@@ -84,30 +100,195 @@ impl DeviceTreeBlob
 
     /* convert this DTB binary into a structured device tree that can be safely walked by Rust code
     <= device tree structure, or None for failure */
-    pub fn to_parsed(&self) -> Option<DeviceTree>
+    pub fn to_parsed(&self) -> Result<DeviceTree, DeviceTreeError>
     {
         /* force a sanity check */
-        if self.sanity_check() == false
+        if self.sanity_check() == false { return Err(DeviceTreeError::FailedSanityCheck); }
+
+        let mut dt = DeviceTree::new();
+
+        let mut offset = u32::from_be(self.off_dt_struct) as usize;
+        let mut path = Vec::<String>::new();
+
+        /* walk through the tokens in the blob. offset is automatically incremented
+        and path is automatically updated as we iterate through sub-nodes into the blob.
+        pass offset and path each iteration, and all the information we need is returned
+        in a DeviceTreeBlobTokenParsed structure */
+        loop
         {
-            return None;
+            match self.parse_token(&mut offset, &mut path)
+            {
+                /* ...and add entries to the structured version */
+                Ok(entry) => dt.edit_property(&entry.full_path, &entry.property, entry.value),
+
+                /* these aren't strictly errors and shouldn't be treated fatally */
+                Err(DeviceTreeError::ReachedEnd) => break,
+                Err(DeviceTreeError::SkippedToken) => (),
+
+                /* ...though these are fatal for the parser */
+                Err(e) => return Err(e)
+            };
         }
 
-        let dt = DeviceTree::new();
-
-        Some(dt)
+        Ok(dt)
     }
 
-    /* lookup a 32-bit value from a DTB string */
-    fn lookup(&self, label: &str) -> Option<u32>
+    /* parse a token in the blob and return an entry to add to the structured device tree
+       => offset = token location in bytes from the start of the blob. this is automatically
+                   updated to the next token after parsing, unless the end of the tree is reached.
+                   this offset value must be u32-word aligned.
+          current_parent_path = a vector of strings of node names for the current parent node. this is
+                                automatically updated as we traverse sub-nodes
+       <= returns entry to add to the tree, or an error/incident code
+    */
+    fn parse_token(&self, offset: &mut usize, current_parent_path: &mut Vec<String>) -> Result<DeviceTreeBlobTokenParsed, DeviceTreeError>
     {
-        let addr = self.get_base() + (u32::from_be(self.off_dt_struct) as usize);
-        return Some(unsafe { core::ptr::read(addr as *const u32) });
+        /* ensure alignment */
+        if is_aligned_u32!(*offset) == false
+        {
+            return Err(DeviceTreeError::TokenUnaligned)
+        }
+
+        let token = match self.read_u32(*offset)
+        {
+            Some(t) => u32::from_be(t),
+            None => return Err(DeviceTreeError::ReachedEnd) /* stop parsing when out of bounds */
+        };
+
+        match token
+        {
+            /* mark the start and end of a node. a node contains any number of properties
+            and any number of child nodes */
+            FDT_BEGIN_NODE =>
+            {
+                /* immediately after this word is a null-terminated string for the node's name.
+                extract that from memory and then add to the current parent node path */
+                align_to_next_u32!(*offset);
+                let node_name = self.get_string(*offset);
+                *offset = *offset + node_name.len();
+                current_parent_path.push(node_name);
+
+                /* move onto the next aligned token */
+                align_to_next_u32!(*offset);
+                return Err(DeviceTreeError::SkippedToken); 
+            },
+            FDT_END_NODE =>
+            {
+                /* step back up the path list */
+                current_parent_path.pop();
+
+                /* move onto the next aligned token */
+                align_to_next_u32!(*offset);
+                return Err(DeviceTreeError::SkippedToken);
+            },
+
+            /* describe a node property */
+            FDT_PROP =>
+            {
+                /* immediately following the token is a 32-bit length parameter
+                and then a 32-bit offset into the string table for the property's name.
+                then follows length number of bytes of data belonging to the property */
+                align_to_next_u32!(*offset);
+                let length = match self.read_u32(*offset)
+                {
+                    Some(l) => u32::from_be(l),
+                    None => return Err(DeviceTreeError::ReachedEnd)
+                };
+
+                align_to_next_u32!(*offset);
+                let string_offset = match self.read_u32(*offset)
+                {
+                    Some(so) => u32::from_be(so),
+                    None => return Err(DeviceTreeError::ReachedEnd)
+                };
+
+                /* skip offset past the data and move onto the next aligned token */
+                align_to_next_u32!(*offset);
+                if length > 0
+                {
+                    *offset = *offset + length as usize;
+                    align_to_next_u32!(*offset);
+                }
+                
+                return Ok(DeviceTreeBlobTokenParsed
+                {
+                    full_path: format!("/{}", current_parent_path.join("/")),
+                    property: self.get_string((string_offset + u32::from_be(self.off_dt_strings)) as usize),
+                    value: DeviceTreeProperty::Empty
+                });
+            },
+
+            /* this marks the end of the blob data structure */
+            FDT_END => return Err(DeviceTreeError::ReachedEnd),
+            _  =>
+            {
+                /* skip this token and try the next */
+                align_to_next_u32!(*offset);
+                return Err(DeviceTreeError::SkippedToken);
+            }
+        };
     }
 
+    /* return the base address of the blob */
     fn get_base(&self) -> usize
     {
-        unsafe { return core::intrinsics::transmute::<&DeviceTreeBlob, usize>(self);  }
+        unsafe { return transmute::<&DeviceTreeBlob, usize>(self) }   
     }
+
+    /* read a 32-bit word at offset bytes from the base address of the blob
+       <= value read, or None for failure */
+    fn read_u32(&self, offset: usize) -> Option<u32>
+    {
+        if offset > u32::from_be(self.totalsize) as usize
+        {
+            return None; /* prevent reading beyond the end of the structure */
+        }
+
+        let addr = self.get_base() + offset;
+        Some(unsafe { core::ptr::read(addr as *const u32) })
+    }
+
+    /* return a copy of a null-terminated string at offset bytes from the base address of the blob */
+    fn get_string(&self, offset: usize) -> String
+    {
+        let addr = self.get_base() + offset;
+
+        let mut count = 0;
+        let count_max = u32::from_be(self.totalsize) as usize; /* for bounds check */
+
+        let mut characters = String::new();
+
+        /* copy string one byte at a time until we hit a null byte. this assumes
+        the string is using the basic ASCII defined in the specification */
+        loop
+        {
+            match unsafe { core::ptr::read((addr + count) as *const u8) }
+            {
+                0 => break,
+                c =>
+                {
+                    characters.push(c as char);
+
+                    /* avoid running off the end of the structure */
+                    align_to_next_u8!(count);
+                    if count >= count_max
+                    {
+                        break;
+                    }
+                }
+            };
+        }
+
+        characters
+    }
+}
+
+/* describe a parsed token as an entry for the structured device tree */
+struct DeviceTreeBlobTokenParsed
+{
+    full_path: String,
+    property: String,
+    value: DeviceTreeProperty
 }
 
 #[derive(Clone)]
@@ -192,17 +373,17 @@ impl DeviceTree
           label = label of property to edit
           value = value of property
     */
-    pub fn edit_property(&mut self, node_path: String, label: String, value: DeviceTreeProperty)
+    pub fn edit_property(&mut self, node_path: &String, label: &String, value: DeviceTreeProperty)
     {
-        if let Some(node) = self.entries.get_mut(&node_path)
+        if let Some(node) = self.entries.get_mut(node_path)
         {
-            node.insert(label, value);
+            node.insert(label.clone(), value);
         }
         else
         {
             let mut properties = HashMap::<String, DeviceTreeProperty>::new();
-            properties.insert(label, value);
-            self.entries.insert(node_path, properties);
+            properties.insert(label.clone(), value);
+            self.entries.insert(node_path.clone(), properties);
         }
     }
 
@@ -211,11 +392,11 @@ impl DeviceTree
           label = property to delete
        <= previous property value, or None for not found
     */
-    pub fn delete_property(&mut self, node_path: String, label: String) -> Option<DeviceTreeProperty>
+    pub fn delete_property(&mut self, node_path: &String, label: &String) -> Option<DeviceTreeProperty>
     {
-        if let Some(node) = self.entries.get_mut(&node_path)
+        if let Some(node) = self.entries.get_mut(node_path)
         {
-            return node.remove(&label)
+            return node.remove(label)
         }
 
         None
@@ -226,11 +407,11 @@ impl DeviceTree
           label = property to find
        <= property value, or None for not found
     */
-    pub fn get_property(&self, node_path: String, label: String) -> Option<&DeviceTreeProperty>
+    pub fn get_property(&self, node_path: &String, label: &String) -> Option<&DeviceTreeProperty>
     {
-        if let Some(node) = self.entries.get(&node_path)
+        if let Some(node) = self.entries.get(node_path)
         {
-            if let Some(property) = node.get(&label)
+            if let Some(property) = node.get(label)
             {
                 return Some(property);
             }
@@ -239,20 +420,36 @@ impl DeviceTree
         None
     }
 
+    /* iterate over all properties in a node
+       => node_path = path of node to examine. this must be full and canonical
+       <= returns iterator for the node's properties, or None if node doesn't exist.
+          each iteration returns a tuple of (property name string, property value) */
+    pub fn property_iter(&self, node_path: &String) -> Option<DeviceTreePropertyIter>
+    {
+        match self.entries.get(node_path)
+        {
+            Some(node) => Some(DeviceTreePropertyIter
+            {
+                iter: node.iter()
+            }),
+            None => None
+        }
+    }
+
     /* remove a whole node from the tree. this will delete all of its properties, too.
        => node_path = path of node to delete. this must be full and canonical
     */
-    pub fn delete_node(&mut self, node_path: String)
+    pub fn delete_node(&mut self, node_path: &String)
     {
-        self.entries.remove(&node_path);
+        self.entries.remove(node_path);
     }
 
     /* detect that a node exists. the given path must be in full and canonical
        <= return true for exact node exists, or false for not
     */
-    pub fn node_exists(&self, node_path: String) -> bool
+    pub fn node_exists(&self, node_path: &String) -> bool
     {
-        self.entries.get(&node_path).is_some()
+        self.entries.get(node_path).is_some()
     }
 
     /* return an iterator of all node paths matching the given path.
@@ -263,6 +460,28 @@ impl DeviceTree
         {
             to_match: node_path_search,
             iter: self.entries.iter()
+        }
+    }
+}
+
+/* iterate over all properties in a node. note the return data per iteration:
+   (String, DeviceTreeProperty) where String contains the property name
+   and DeviceTreeProperty contains the property value */
+pub struct DeviceTreePropertyIter<'a>
+{
+    iter: Iter<'a, alloc::string::String, DeviceTreeProperty>
+}
+
+impl Iterator for DeviceTreePropertyIter<'_>
+{
+    type Item = (String, DeviceTreeProperty);
+
+    fn next(&mut self) -> Option<Self::Item>
+    {
+        match self.iter.next()
+        {
+            Some((s, v)) => Some((s.clone(), v.clone())),
+            None => None
         }
     }
 }
@@ -282,7 +501,7 @@ impl Iterator for DeviceTreeIter<'_>
     {
         loop
         {
-            if let Some((node_path, properties)) = self.iter.next()
+            if let Some((node_path, _)) = self.iter.next()
             {
                 if node_path.as_str().starts_with(self.to_match.as_str()) == true
                 {
@@ -302,16 +521,18 @@ impl core::fmt::Debug for DeviceTree
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
     {
-        for (node_path, properties) in self.entries.iter()
+        for node in self.iter(String::from("/"))
         {
-            write!(f, "{}:\n", node_path);
-
-            for (label, property) in properties.iter()
+            write!(f, "{}\n", node);
+            if let Some(iter) = self.property_iter(&node)
             {
-                write!(f, "--> {} = {:?}\n", label, property);
+                for (name, value) in iter
+                {
+                    write!(f, " {} = {:?}\n", name, value);
+                }
             }
         }
 
-        write!(f, "")
+        Ok(())
     }
 }
