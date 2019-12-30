@@ -32,6 +32,7 @@ const LOWEST_SUPPORTED_VERSION: u32 = 16;
 const FDT_BEGIN_NODE:   u32 = 0x00000001;
 const FDT_END_NODE:     u32 = 0x00000002;
 const FDT_PROP:         u32 = 0x00000003;
+const FDT_NOP:          u32 = 0x00000004;
 const FDT_END:          u32 = 0x00000009;
 
 /* useful macros for rounding an address up to the next word boundaries */
@@ -42,12 +43,15 @@ macro_rules! align_to_next_u8  { ($a:expr) => ($a = $a + 1);        }
 macro_rules! is_aligned_u32    { ($a:expr) => (($a & 3) == 0);      }
 
 /* define parsing errors / results */
+#[derive(Debug)]
 pub enum DeviceTreeError
 {
     FailedSanityCheck,
     ReachedEnd,
+    ReachedUnexpectedEnd,
     TokenUnaligned,
-    SkippedToken
+    SkippedToken,
+    BadToken(u32)
 }
 
 /* define the header for a raw device tree blob */
@@ -121,7 +125,7 @@ impl DeviceTreeBlob
                 /* ...and add entries to the structured version */
                 Ok(entry) => dt.edit_property(&entry.full_path, &entry.property, entry.value),
 
-                /* these aren't strictly errors and shouldn't be treated fatally */
+                /* these aren't errors and shouldn't be treated fatally */
                 Err(DeviceTreeError::ReachedEnd) => break,
                 Err(DeviceTreeError::SkippedToken) => (),
 
@@ -152,7 +156,7 @@ impl DeviceTreeBlob
         let token = match self.read_u32(*offset)
         {
             Some(t) => u32::from_be(t),
-            None => return Err(DeviceTreeError::ReachedEnd) /* stop parsing when out of bounds */
+            None => return Err(DeviceTreeError::ReachedUnexpectedEnd) /* stop parsing when out of bounds */
         };
 
         match token
@@ -192,27 +196,29 @@ impl DeviceTreeBlob
                 let length = match self.read_u32(*offset)
                 {
                     Some(l) => u32::from_be(l),
-                    None => return Err(DeviceTreeError::ReachedEnd)
+                    None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
                 align_to_next_u32!(*offset);
                 let string_offset = match self.read_u32(*offset)
                 {
                     Some(so) => u32::from_be(so),
-                    None => return Err(DeviceTreeError::ReachedEnd)
+                    None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
-                /* skip offset past the data and move onto the next aligned token */
+                /* skip offset past the length and string offset header, as well as the data */
                 align_to_next_u32!(*offset);
-                if length > 0
+                *offset = *offset + length as usize;
+
+                /* don't forget to align to a boundary if necessary */
+                if is_aligned_u32!(*offset) == false
                 {
-                    *offset = *offset + length as usize;
                     align_to_next_u32!(*offset);
                 }
-                
+                                
                 return Ok(DeviceTreeBlobTokenParsed
                 {
-                    full_path: format!("/{}", current_parent_path.join("/")),
+                    full_path: format!("{}", current_parent_path.join("/")),
                     property: self.get_string((string_offset + u32::from_be(self.off_dt_strings)) as usize),
                     value: DeviceTreeProperty::Empty
                 });
@@ -220,12 +226,16 @@ impl DeviceTreeBlob
 
             /* this marks the end of the blob data structure */
             FDT_END => return Err(DeviceTreeError::ReachedEnd),
-            _  =>
+
+            /* handle NOPs and bad tokens */
+            FDT_NOP =>
             {
                 /* skip this token and try the next */
                 align_to_next_u32!(*offset);
                 return Err(DeviceTreeError::SkippedToken);
-            }
+            },
+
+            t => return Err(DeviceTreeError::BadToken(t))
         };
     }
 
@@ -291,7 +301,7 @@ struct DeviceTreeBlobTokenParsed
     value: DeviceTreeProperty
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DeviceTreeProperty
 {
     Empty,
@@ -301,49 +311,6 @@ pub enum DeviceTreeProperty
     Handle(u32),
     Array(Vec<u32>),
     Strings(Vec<String>)
-}
-
-impl core::fmt::Debug for DeviceTreeProperty
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-    {
-        match self
-        {
-            DeviceTreeProperty::Empty          => write!(f, "Empty"),
-            DeviceTreeProperty::Unsigned32(v)  => write!(f, "<u32> {} (0x{:x})", v, v),
-            DeviceTreeProperty::Unsigned64(v)  => write!(f, "<u64> {} (0x{:x})", v, v),
-            DeviceTreeProperty::Text(s)        => write!(f, "<string> {}", s),
-            DeviceTreeProperty::Handle(handle) => write!(f, "<phandle> {} (0x{:x})", handle, handle),
-
-            DeviceTreeProperty::Array(list) =>
-            {
-                write!(f, "<prop-encoded-array> ");
-                for i in 0..list.len()
-                {
-                    write!(f, "{} (0x{:x})", list[i], list[i]);
-                    if i != list.len() - 1
-                    {
-                        write!(f, ", ");
-                    }
-                }
-                write!(f, "")
-            },
-
-            DeviceTreeProperty::Strings(list) =>
-            {
-                write!(f, "<stringlist> ");
-                for i in 0..list.len()
-                {
-                    write!(f, "'{}'", list[i]);
-                    if i != list.len() - 1
-                    {
-                        write!(f, ", ");
-                    }
-                }
-                write!(f, "")
-            },
-        }
-    }
 }
 
 /* parsed device tree */
@@ -530,9 +497,19 @@ impl core::fmt::Debug for DeviceTree
                 {
                     write!(f, " {} = {:?}\n", name, value);
                 }
+                write!(f, "\n");
             }
         }
 
         Ok(())
+    }
+}
+
+/* for debugging in Qemu on RISC-V */
+fn debug(s: &str)
+{
+    for c in s.bytes()
+    {
+        unsafe { *(0x10000000 as *mut u8) = c };
     }
 }
