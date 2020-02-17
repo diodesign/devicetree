@@ -10,7 +10,7 @@
  * 
  * This does not require the standard library, but it does require a heap allocator.
  * 
- * (c) Chris Williams, 2019.
+ * (c) Chris Williams, 2019-2020
  *
  * See LICENSE for usage and copying.
  */
@@ -22,18 +22,24 @@
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::mem::{transmute};
+use core::mem::{transmute, size_of};
 
 extern crate hashbrown;
 use hashbrown::hash_map::{HashMap, Iter};
 
+/* we support any DTB backwards compatible to this spec version number */
 const LOWEST_SUPPORTED_VERSION: u32 = 16; 
 
+/* DTB token ID numbers, hardwired into the spec */
 const FDT_BEGIN_NODE:   u32 = 0x00000001;
 const FDT_END_NODE:     u32 = 0x00000002;
 const FDT_PROP:         u32 = 0x00000003;
 const FDT_NOP:          u32 = 0x00000004;
 const FDT_END:          u32 = 0x00000009;
+
+/* defaults for #address-cells and #size-cells from the specification */
+const DefaultAddressCells: usize = 2;
+const DefaultSizeCells:    usize = 1;
 
 /* useful macros for rounding an address up to the next word boundaries */
 macro_rules! align_to_next_u32 { ($a:expr) => ($a = ($a & !3) + 4); }
@@ -42,16 +48,25 @@ macro_rules! align_to_next_u8  { ($a:expr) => ($a = $a + 1);        }
 /* returns true if address is aligned to a 32-bit word boundary */
 macro_rules! is_aligned_u32    { ($a:expr) => (($a & 3) == 0);      }
 
+/* nodes in paths are separated by a / */
+const DeviceTreeSeparator: &'static str = "/";
+
 /* define parsing errors / results */
 #[derive(Debug)]
 pub enum DeviceTreeError
 {
+    /* DTB parsing errors */
+    CannotConvert,
     FailedSanityCheck,
     ReachedEnd,
     ReachedUnexpectedEnd,
     TokenUnaligned,
     SkippedToken,
-    BadToken(u32)
+    BadToken(u32),
+
+    /* device tree processing */
+    NotFound,
+    WidthUnsupported,
 }
 
 /* define the header for a raw device tree blob */
@@ -223,8 +238,8 @@ impl DeviceTreeBlob
                 let full_path = match current_parent_path.len()
                 {
                     0 => String::new(),
-                    1 => String::from("/"),
-                    _ => current_parent_path.join("/")
+                    1 => String::from(DeviceTreeSeparator),
+                    _ => current_parent_path.join(DeviceTreeSeparator)
                 };
 
                 return Ok(DeviceTreeBlobTokenParsed
@@ -292,13 +307,18 @@ impl DeviceTreeBlob
 
         let mut characters = String::new();
 
-        /* copy string one byte at a time until we hit a null byte. this assumes
-        the string is using the basic ASCII defined in the specification */
+        /* copy string one byte at a time until we hit a null byte or a colon ":" character.
+        this assumes the string is using basic 7-bit ASCII as defined in the specification.
+        colons are not allowed in node nor property names, but may be used to add parameters
+        after a property name in a /chosen subnode. we ignore the colon and any
+        subsequent parameters. */
         loop
         {
             match unsafe { core::ptr::read((addr + count) as *const u8) }
             {
-                0 => break,
+                /* stop at null or colon bytes (see above comment) */
+                b'\0' | b':' => break,
+                /* accept all other characters */
                 c =>
                 {
                     characters.push(c as char);
@@ -325,18 +345,131 @@ struct DeviceTreeBlobTokenParsed
     value: DeviceTreeProperty
 }
 
-/* convert the contents of a property into various formats */
+/* convert the contents of a property into various formats. the DTB parser
+will store the property's data as Bytes() or Empty(). To get it into
+a more useful format, call one of the as_...() functions in DeviceTreeProperty */
 #[derive(Clone, Debug)]
 pub enum DeviceTreeProperty
 {
     Empty,
     Bytes(Vec<u8>),
-    Reg
+    
+    MultipleUnsignedInt64_64(Vec<(u64, u64)>),
+    MultipleUnsignedInt64_32(Vec<(u64, u32)>),
+    MultipleUnsignedInt32_32(Vec<(u32, u32)>),
+
+    MultipleUnsignedInt64(Vec<u64>),
+    MultipleUnsignedInt32(Vec<u32>),
+
+    UnsignedInt32(u32),
+    Text(String),
+    MultipleText(Vec<String>),
 }
 
 impl DeviceTreeProperty
 {
-    // pub fn as_reg(&self) -> Vec()
+    /* convert array of bytes into Rust vector of whole 64-bit words */
+    pub fn as_multi_u64(&self) -> Result<Vec<u64>, DeviceTreeError>
+    {
+        if let DeviceTreeProperty::Bytes(v) = self
+        {
+            let mut list = Vec::<u64>::new();
+            for word in 0..(v.len() >> 3) /* divide by 8 (8 bytes in a 64-bit word) */
+            {
+                let i = word * size_of::<u64>();
+                let int: u64 =
+                    (v[i + 0] as u64) << 56 |
+                    (v[i + 1] as u64) << 48 |
+                    (v[i + 2] as u64) << 40 |
+                    (v[i + 3] as u64) << 32 |
+                    (v[i + 4] as u64) << 24 |
+                    (v[i + 5] as u64) << 16 |
+                    (v[i + 6] as u64) << 8  |
+                    (v[i + 7] as u64) << 0;
+                list.push(int);
+            }
+            return Ok(list);
+        };
+        return Err(DeviceTreeError::CannotConvert);
+    }
+
+    /* convert array of bytes into Rust vector of whole 32-bit words */
+    pub fn as_multi_u32(&self) -> Result<Vec<u32>, DeviceTreeError>
+    {
+        if let DeviceTreeProperty::Bytes(v) = self
+        {
+            let mut list = Vec::<u32>::new();
+            for word in 0..(v.len() >> 2) /* divide by 4 (4 bytes in a 32-bit word) */
+            {
+                let i = word * size_of::<u32>();
+                let int: u32 = (v[i + 0] as u32) << 24 | (v[i + 1] as u32) << 16 | (v[i + 2] as u32) << 8 | (v[i + 3] as u32);
+                list.push(int);
+            }
+            return Ok(list);
+        };
+        return Err(DeviceTreeError::CannotConvert);
+    }
+
+    /* return first four bytes as unsigned 32-bit integer */
+    pub fn as_u32(&self) -> Result<u32, DeviceTreeError>
+    {
+        if let DeviceTreeProperty::Bytes(v) = self
+        {
+            if v.len() >= size_of::<u32>()
+            {
+                let int: u32 = (v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | (v[3] as u32);
+                return Ok(int);
+            }
+        };
+        return Err(DeviceTreeError::CannotConvert);
+    }
+
+    /* convert array of bytes, up to terminating null or end of array, into a Rust string */
+    pub fn as_text(&self) -> Result<String, DeviceTreeError>
+    {
+        if let DeviceTreeProperty::Bytes(v) = self
+        {
+            let mut text = String::new();
+            for c in v
+            {
+                if *c == 0 { break; }
+                text.push(*c as char);
+            }
+            return Ok(text);
+        };
+        return Err(DeviceTreeError::CannotConvert);
+    }
+
+    /* convert multiple character arrays, split by terminating null, into a vector of Rust strings */
+    pub fn as_multi_text(&self) -> Result<Vec<String>, DeviceTreeError>
+    {
+        if let DeviceTreeProperty::Bytes(v) = self
+        {
+            let mut list = Vec::<String>::new();
+            loop
+            {
+                let mut text = String::new();
+                for c in v
+                {
+                    if *c == 0 { break; }
+                    text.push(*c as char);
+                }
+                list.push(text);
+            }
+            return Ok(list);
+        };
+        return Err(DeviceTreeError::CannotConvert);
+    }
+}
+
+/* a node can contain child nodes that contain properties. these
+properties can be in the form of (base address, size of object).
+the parent node defines the bit length of these addresses and sizes 
+in multiples of u32 cells */
+pub struct AddressSizeCells
+{
+    pub address: usize, /* number of unsigned 32-bit cells to hold an address */
+    pub size: usize     /* number of unsigned 32-bit cells to hold a size */
 }
 
 /* parsed device tree */
@@ -395,22 +528,59 @@ impl DeviceTree
         None
     }
 
+    /* get the address-cell and size-cell properties of a given node.
+    if no entries can be found, use specification's defaults.
+       => node_path = path of node to inspect. this must be full and canonical
+       <= AddressSizeCells structure for the node
+    */
+    pub fn get_address_size_cells(&self, node_path: &String) -> AddressSizeCells
+    {
+        let mut addr_cells = DefaultAddressCells;
+        let mut size_cells = DefaultSizeCells;
+
+        match self.get_property(node_path, &format!("#address-cells"))
+        {
+            Ok(prop_value) => match prop_value.as_u32()
+            {
+                Ok(value) => addr_cells = value as usize,
+                _ => ()
+            },
+            _ => ()
+        };
+
+        match self.get_property(node_path, &format!("#size-cells"))
+        {
+            Ok(prop_value) => match prop_value.as_u32()
+            {
+                Ok(value) => size_cells = value as usize,
+                _ => ()
+            },
+            _ => ()
+        };
+
+        AddressSizeCells
+        {
+            address: addr_cells,
+            size: size_cells
+        }
+    }
+
     /* look up the value of a property in a node
        => node_path = path of node to find. this must be full and canonical
           label = property to find
        <= property value, or None for not found
     */
-    pub fn get_property(&self, node_path: &String, label: &String) -> Option<&DeviceTreeProperty>
+    pub fn get_property(&self, node_path: &String, label: &String) -> Result<&DeviceTreeProperty, DeviceTreeError>
     {
         if let Some(node) = self.entries.get(node_path)
         {
             if let Some(property) = node.get(label)
             {
-                return Some(property);
+                return Ok(property);
             }
         }
 
-        None
+        Err(DeviceTreeError::NotFound)
     }
 
     /* iterate over all properties in a node
@@ -446,12 +616,18 @@ impl DeviceTree
     }
 
     /* return an iterator of all node paths matching the given path.
-    note that this does greedy path matching, so searching for '/cpus' will match /cpus@0, /cpus@1, /cpus@3 etc */
-    pub fn iter(&self, node_path_search: String) -> DeviceTreeIter
+    note: this does greedy path matching, so searching for '/cpu' will match /cpu/cpus@0, /cpu/cpus@1, /cpu/cpus@3 etc
+       => node_path_search = start of path string to match
+          depth = the max number of '/' characters in the path before a match is returned. use this to
+                  avoid iterating over child nodes when you just want the parent. eg, a depth of 2 for /cpu/cpus@
+                  will match '/cpu/cpus@0' not '/cpu/cpus@/interrupt-controller'
+       <= iterator of matching strings */
+    pub fn iter(&self, node_path_search: &String, depth: DeviceTreeIterDepth) -> DeviceTreeIter
     {
         DeviceTreeIter
         {
-            to_match: node_path_search,
+            depth: depth,
+            to_match: node_path_search.clone(),
             iter: self.entries.iter()
         }
     }
@@ -479,9 +655,13 @@ impl Iterator for DeviceTreePropertyIter<'_>
     }
 }
 
+/* used to control the depth of the device tree search */
+pub type DeviceTreeIterDepth = usize;
+
 /* iterate over all matching node paths */
 pub struct DeviceTreeIter<'a>
 {
+    depth: DeviceTreeIterDepth,
     to_match: String,
     iter: Iter<'a, String, HashMap<String, DeviceTreeProperty>>
 }
@@ -496,6 +676,12 @@ impl Iterator for DeviceTreeIter<'_>
         {
             if let Some((node_path, _)) = self.iter.next()
             {
+                /* skip if we're out of our depth: don't go beyond self.depth number of / characters in path */
+                if node_path.as_str().matches(DeviceTreeSeparator).count() > self.depth
+                {
+                    continue;
+                }
+
                 if node_path.as_str().starts_with(self.to_match.as_str()) == true
                 {
                     return Some(node_path.clone());
@@ -514,7 +700,7 @@ impl core::fmt::Debug for DeviceTree
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
     {
-        for node in self.iter(String::from("/"))
+        for node in self.iter(&String::from(DeviceTreeSeparator), DeviceTreeIterDepth::max_value())
         {
             write!(f, "{}\n", node);
             if let Some(iter) = self.property_iter(&node)
@@ -531,11 +717,18 @@ impl core::fmt::Debug for DeviceTree
     }
 }
 
-/* for debugging in Qemu on RISC-V */
-fn debug(s: &str)
+/* return the parent of the given node path, going no higher than '/'.
+if the path contains no '/' then, return '/' */
+pub fn get_parent(path: &String) -> String
 {
-    for c in s.bytes()
+    if let Some(index) = path.as_str().rfind(DeviceTreeSeparator)
     {
-        unsafe { *(0x10000000 as *mut u8) = c };
+        let (before, after) = path.as_str().split_at(index);
+        if before.len() > 0
+        {
+            return String::from(before)
+        }
     }
+
+    String::from(DeviceTreeSeparator)
 }
