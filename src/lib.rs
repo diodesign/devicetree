@@ -15,17 +15,22 @@
  * See LICENSE for usage and copying.
  */
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+
+#[cfg(test)]
+mod tests;
 
 #[macro_use]
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
+
 use core::mem::{transmute, size_of};
 
 extern crate hashbrown;
 use hashbrown::hash_map::{HashMap, Iter};
+
+extern crate byterider;
 
 /* we support any DTB backwards compatible to this spec version number */
 const LOWEST_SUPPORTED_VERSION: u32 = 16; 
@@ -79,7 +84,7 @@ pub struct DeviceTreeBlob
     off_dt_strings: u32,
     off_mem_rsvmap: u32,
     version: u32,
-     last_comp_version: u32,
+    last_comp_version: u32,
     boot_cpuid_phys: u32,
     size_dt_strings: u32,
     size_dt_struct: u32
@@ -99,7 +104,7 @@ impl DeviceTreeBlob
     }
 
     /* convert this DTB binary into a structured device tree that can be safely walked by Rust code
-    <= device tree structure, or None for failure */
+    <= device tree structure, or error code for failure */
     pub fn to_parsed(&self) -> Result<DeviceTree, DeviceTreeError>
     {
         /* force a sanity check */
@@ -139,7 +144,7 @@ impl DeviceTreeBlob
                    this offset value must be u32-word aligned.
           current_parent_path = a vector of strings of node names for the current parent node. this is
                                 automatically updated as we traverse sub-nodes
-       <= returns entry to add to the tree, or an error/incident code
+       <= returns entry to add to the tree, or an error code
     */
     fn parse_token(&self, offset: &mut usize, current_parent_path: &mut Vec<String>) -> Result<DeviceTreeBlobTokenParsed, DeviceTreeError>
     {
@@ -631,6 +636,11 @@ impl DeviceTree
             iter: self.entries.iter()
         }
     }
+
+    /* pub fn to_blob() -> 
+    {
+
+    } */
 }
 
 /* iterate over all properties in a node. note the return data per iteration:

@@ -5,5 +5,8 @@ authors = ["Chris Williams <diodesign@tuta.io>"]
 edition = "2018"
 
 [dependencies.hashbrown]
-version = "0.6.3"
+version = "0.7.2"
 features = [ "nightly" ]
+
+[dependencies.byterider]
+path = "../byterider"
