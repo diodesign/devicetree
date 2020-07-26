@@ -2,35 +2,42 @@
  *
  * Based on specs from: https://www.devicetree.org/specifications/ [v0.3-rc2]
  * 
- * To read a device tree blob into a parsed device tree structure, call DeviceTreeBlob::to_parsed()
- * To write a device tree structure as a device tree blob, call DeviceTree::to_blob()
+ * To read a device tree blob binary into a parsed device tree structure:
+ * 1. call DeviceTreeBlob::from_slice() using a byte slice of the blob in memory
+ * 2. call to_parsed() on the DeviceTreeBlob object to create a parsed DeviceTree
+ * 
+ * The parsed DeviceTree can be queried and modified.
+ * 
+ * To write a parsed device tree structure to memory as a device tree blob binary:
+ * 1. Create a new DeviceTree using new() and populate it, or use an existing DeviceTree
+ * 2. call DeviceTree::to_blob()
  * 
  * The parsed device tree is designed to be safely iterated over, searched, cloned, and
  * modified by Rust code. Note: This code ignores empty nodes with no properties - FIXME?
  * 
  * This does not require the standard library, but it does require a heap allocator.
  * 
- * (c) Chris Williams, 2019-2020
+ * (c) Chris Williams, 2019-2020.
  *
  * See LICENSE for usage and copying.
  */
-
 #![cfg_attr(not(test), no_std)]
 
-#[cfg(test)]
-mod tests;
+#[cfg(test)] extern crate std;
+#[cfg(test)] mod tests;
 
 #[macro_use]
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use core::mem::{transmute, size_of};
+use core::mem::size_of;
 
 extern crate hashbrown;
 use hashbrown::hash_map::{HashMap, Iter};
 
 extern crate byterider;
+use byterider::{Bytes, Ordering};
 
 /* we support any DTB backwards compatible to this spec version number */
 const LOWEST_SUPPORTED_VERSION: u32 = 16; 
@@ -43,8 +50,8 @@ const FDT_NOP:          u32 = 0x00000004;
 const FDT_END:          u32 = 0x00000009;
 
 /* defaults for #address-cells and #size-cells from the specification */
-const DefaultAddressCells: usize = 2;
-const DefaultSizeCells:    usize = 1;
+const DEFAULTADDRESSCELLS: usize = 2;
+const DEFAULTSIZECELLS:    usize = 1;
 
 /* useful macros for rounding an address up to the next word boundaries */
 macro_rules! align_to_next_u32 { ($a:expr) => ($a = ($a & !3) + 4); }
@@ -54,7 +61,7 @@ macro_rules! align_to_next_u8  { ($a:expr) => ($a = $a + 1);        }
 macro_rules! is_aligned_u32    { ($a:expr) => (($a & 3) == 0);      }
 
 /* nodes in paths are separated by a / */
-const DeviceTreeSeparator: &'static str = "/";
+const DEVICETREESEPARATOR: &'static str = "/";
 
 /* define parsing errors / results */
 #[derive(Debug)]
@@ -62,7 +69,7 @@ pub enum DeviceTreeError
 {
     /* DTB parsing errors */
     CannotConvert,
-    FailedSanityCheck,
+    FailedMagicCheck,
     ReachedEnd,
     ReachedUnexpectedEnd,
     TokenUnaligned,
@@ -75,9 +82,10 @@ pub enum DeviceTreeError
 }
 
 /* define the header for a raw device tree blob */
-#[repr(C)]
+#[allow(dead_code)]
 pub struct DeviceTreeBlob
 {
+    /* the tree blob header */
     magic: u32,
     totalsize: u32,
     off_dt_struct: u32,
@@ -87,13 +95,16 @@ pub struct DeviceTreeBlob
     last_comp_version: u32,
     boot_cpuid_phys: u32,
     size_dt_strings: u32,
-    size_dt_struct: u32
+    size_dt_struct: u32,
+
+    /* a copy of the raw bytes in the blob */
+    bytes: Bytes
 }
 
 impl DeviceTreeBlob
 {
     /* return true if this looks like legit DTB data, or false if not */
-    pub fn sanity_check(&self) -> bool
+    pub fn valid_magic_check(&self) -> bool
     {
         if u32::from_be(self.magic) != 0xd00dfeed || u32::from_be(self.last_comp_version) > LOWEST_SUPPORTED_VERSION
         {
@@ -103,12 +114,43 @@ impl DeviceTreeBlob
         return true;
     }
 
+    /* create a basic DeviceTreeBlob structure from a byte slice of a device tree blob.
+    Note: this will create a copy of the byte slice on the heap.
+    <= device tree blob as a byte slice
+    => a DeviceTreeBlob object, or error core for failure */
+    pub fn from_slice(blob: &[u8]) -> Result<DeviceTreeBlob, DeviceTreeError>
+    {
+        let mut bytes = Bytes::from_slice(blob);
+        bytes.set_ordering(Ordering::BigEndian); /* device tree blobs are stored in BE */
+
+        let dtb = DeviceTreeBlob
+        {
+            magic:              bytes.read_word(0 * 4).unwrap(),
+            totalsize:          bytes.read_word(1 * 4).unwrap(),
+            off_dt_struct:      bytes.read_word(2 * 4).unwrap(),
+            off_dt_strings:     bytes.read_word(3 * 4).unwrap(),
+            off_mem_rsvmap:     bytes.read_word(4 * 4).unwrap(),
+            version:            bytes.read_word(5 * 4).unwrap(),
+            last_comp_version:  bytes.read_word(6 * 4).unwrap(),
+            boot_cpuid_phys:    bytes.read_word(7 * 4).unwrap(),
+            size_dt_strings:    bytes.read_word(8 * 4).unwrap(),
+            size_dt_struct:     bytes.read_word(9 * 4).unwrap(),
+            bytes:              bytes
+        };
+
+        match dtb.valid_magic_check()
+        {
+            true => Ok(dtb),
+            false => Err(DeviceTreeError::FailedMagicCheck)
+        }
+    }
+
     /* convert this DTB binary into a structured device tree that can be safely walked by Rust code
-    <= device tree structure, or error code for failure */
+    => device tree structure, or error code for failure */
     pub fn to_parsed(&self) -> Result<DeviceTree, DeviceTreeError>
     {
-        /* force a sanity check */
-        if self.sanity_check() == false { return Err(DeviceTreeError::FailedSanityCheck); }
+        /* force a magic check */
+        if self.valid_magic_check() == false { return Err(DeviceTreeError::FailedMagicCheck); }
 
         let mut dt = DeviceTree::new();
 
@@ -154,7 +196,7 @@ impl DeviceTreeBlob
             return Err(DeviceTreeError::TokenUnaligned)
         }
 
-        let token = match self.read_u32(*offset)
+        let token = match self.bytes.read_word(*offset)
         {
             Some(t) => u32::from_be(t),
             None => return Err(DeviceTreeError::ReachedUnexpectedEnd) /* stop parsing when out of bounds */
@@ -194,14 +236,14 @@ impl DeviceTreeBlob
                 and then a 32-bit offset into the string table for the property's name.
                 then follows length number of bytes of data belonging to the property */
                 align_to_next_u32!(*offset);
-                let length = match self.read_u32(*offset)
+                let length = match self.bytes.read_word(*offset)
                 {
                     Some(l) => u32::from_be(l),
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
                 align_to_next_u32!(*offset);
-                let string_offset = match self.read_u32(*offset)
+                let string_offset = match self.bytes.read_word(*offset)
                 {
                     Some(so) => u32::from_be(so),
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
@@ -218,7 +260,7 @@ impl DeviceTreeBlob
                         let mut array = Vec::<u8>::new();
                         for _ in 0..length
                         {
-                            if let Some(byte) = self.read_u8(*offset)
+                            if let Some(byte) = self.bytes.read_byte(*offset)
                             {
                                 array.push(byte);
                                 align_to_next_u8!(*offset);
@@ -243,8 +285,8 @@ impl DeviceTreeBlob
                 let full_path = match current_parent_path.len()
                 {
                     0 => String::new(),
-                    1 => String::from(DeviceTreeSeparator),
-                    _ => current_parent_path.join(DeviceTreeSeparator)
+                    1 => String::from(DEVICETREESEPARATOR),
+                    _ => current_parent_path.join(DEVICETREESEPARATOR)
                 };
 
                 return Ok(DeviceTreeBlobTokenParsed
@@ -270,46 +312,10 @@ impl DeviceTreeBlob
         };
     }
 
-    /* return the base address of the blob */
-    fn get_base(&self) -> usize
-    {
-        unsafe { return transmute::<&DeviceTreeBlob, usize>(self) }   
-    }
-
-    /* read a 32-bit word at offset bytes from the base address of the blob
-       <= value read, or None for failure */
-    fn read_u32(&self, offset: usize) -> Option<u32>
-    {
-        if offset > u32::from_be(self.totalsize) as usize
-        {
-            return None; /* prevent reading beyond the end of the structure */
-        }
-
-        let addr = self.get_base() + offset;
-        Some(unsafe { core::ptr::read(addr as *const u32) })
-    }
-
-    /* read a byte at offset bytes from the base address of the blob
-    <= value read, or None for failure */
-    fn read_u8(&self, offset: usize) -> Option<u8>
-    {
-        if offset > u32::from_be(self.totalsize) as usize
-        {
-            return None; /* prevent reading beyond the end of the structure */
-        }
-
-        let addr = self.get_base() + offset;
-        Some(unsafe { core::ptr::read(addr as *const u8) })
-    }
-
     /* return a copy of a null-terminated string at offset bytes from the base address of the blob */
     fn get_string(&self, offset: usize) -> String
     {
-        let addr = self.get_base() + offset;
-
         let mut count = 0;
-        let count_max = u32::from_be(self.totalsize) as usize; /* for bounds check */
-
         let mut characters = String::new();
 
         /* copy string one byte at a time until we hit a null byte or a colon ":" character.
@@ -319,23 +325,21 @@ impl DeviceTreeBlob
         subsequent parameters. */
         loop
         {
-            match unsafe { core::ptr::read((addr + count) as *const u8) }
+            match self.bytes.read_byte(offset + count)
             {
-                /* stop at null or colon bytes (see above comment) */
-                b'\0' | b':' => break,
-                /* accept all other characters */
-                c =>
+                Some(c) => match c
                 {
-                    characters.push(c as char);
-
-                    /* avoid running off the end of the structure */
-                    align_to_next_u8!(count);
-                    if count >= count_max
+                    /* stop at null or colon bytes (see above comment) */
+                    b'\0' | b':' => break,
+                    /* accept all other characters */
+                    c =>
                     {
-                        break;
+                        characters.push(c as char);
+                        align_to_next_u8!(count);
                     }
-                }
-            };
+                },
+                None => break
+            }
         }
 
         characters
@@ -451,18 +455,17 @@ impl DeviceTreeProperty
         if let DeviceTreeProperty::Bytes(v) = self
         {
             let mut list = Vec::<String>::new();
-            loop
+            let mut text = String::new();
+            for c in v
             {
-                let mut text = String::new();
-                for c in v
-                {
-                    if *c == 0 { break; }
-                    text.push(*c as char);
-                }
-                list.push(text);
+                if *c == 0 { break; }
+                text.push(*c as char);
             }
+            list.push(text);
+
             return Ok(list);
-        };
+        }
+
         return Err(DeviceTreeError::CannotConvert);
     }
 }
@@ -540,8 +543,8 @@ impl DeviceTree
     */
     pub fn get_address_size_cells(&self, node_path: &String) -> AddressSizeCells
     {
-        let mut addr_cells = DefaultAddressCells;
-        let mut size_cells = DefaultSizeCells;
+        let mut addr_cells = DEFAULTADDRESSCELLS;
+        let mut size_cells = DEFAULTSIZECELLS;
 
         match self.get_property(node_path, &format!("#address-cells"))
         {
@@ -687,7 +690,7 @@ impl Iterator for DeviceTreeIter<'_>
             if let Some((node_path, _)) = self.iter.next()
             {
                 /* skip if we're out of our depth: don't go beyond self.depth number of / characters in path */
-                if node_path.as_str().matches(DeviceTreeSeparator).count() > self.depth
+                if node_path.as_str().matches(DEVICETREESEPARATOR).count() > self.depth
                 {
                     continue;
                 }
@@ -710,16 +713,16 @@ impl core::fmt::Debug for DeviceTree
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
     {
-        for node in self.iter(&String::from(DeviceTreeSeparator), DeviceTreeIterDepth::max_value())
+        for node in self.iter(&String::from(DEVICETREESEPARATOR), DeviceTreeIterDepth::max_value())
         {
-            write!(f, "{}\n", node);
+            write!(f, "{}\n", node)?;
             if let Some(iter) = self.property_iter(&node)
             {
                 for (name, value) in iter
                 {
-                    write!(f, " {} = {:?}\n", name, value);
+                    write!(f, " {} = {:?}\n", name, value)?;
                 }
-                write!(f, "\n");
+                write!(f, "\n")?;
             }
         }
 
@@ -731,14 +734,14 @@ impl core::fmt::Debug for DeviceTree
 if the path contains no '/' then, return '/' */
 pub fn get_parent(path: &String) -> String
 {
-    if let Some(index) = path.as_str().rfind(DeviceTreeSeparator)
+    if let Some(index) = path.as_str().rfind(DEVICETREESEPARATOR)
     {
-        let (before, after) = path.as_str().split_at(index);
+        let (before, _) = path.as_str().split_at(index);
         if before.len() > 0
         {
             return String::from(before)
         }
     }
 
-    String::from(DeviceTreeSeparator)
+    String::from(DEVICETREESEPARATOR)
 }
