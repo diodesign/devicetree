@@ -30,8 +30,9 @@
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
-
 use core::mem::size_of;
+
+extern crate qemuprint;
 
 extern crate hashbrown;
 use hashbrown::hash_map::{HashMap, Iter};
@@ -48,6 +49,9 @@ const FDT_END_NODE:     u32 = 0x00000002;
 const FDT_PROP:         u32 = 0x00000003;
 const FDT_NOP:          u32 = 0x00000004;
 const FDT_END:          u32 = 0x00000009;
+
+/* DTB header magic numbers */
+const DTB_MAGIC: u32 = 0xd00dfeed;
 
 /* defaults for #address-cells and #size-cells from the specification */
 const DEFAULTADDRESSCELLS: usize = 2;
@@ -106,7 +110,7 @@ impl DeviceTreeBlob
     /* return true if this looks like legit DTB data, or false if not */
     pub fn valid_magic_check(&self) -> bool
     {
-        if u32::from_be(self.magic) != 0xd00dfeed || u32::from_be(self.last_comp_version) > LOWEST_SUPPORTED_VERSION
+        if u32::from_be(self.magic) != DTB_MAGIC || u32::from_be(self.last_comp_version) > LOWEST_SUPPORTED_VERSION
         {
             return false;
         }
@@ -644,7 +648,15 @@ impl DeviceTree
        <= byte array containing the device tree blob */
     pub fn to_blob(&self) -> Vec<u8>
     {
-        Vec::new()
+        let mut bytes = Bytes::new();
+        bytes.set_ordering(Ordering::BigEndian);
+
+        /* write out metadata */
+        bytes.add_word(DTB_MAGIC);
+        bytes.add_word(LOWEST_SUPPORTED_VERSION);
+        bytes.add_word(0); /* boot_cpuid_phys */
+
+        bytes.as_vec()
     }
 }
 
