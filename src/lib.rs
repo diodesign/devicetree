@@ -640,10 +640,12 @@ impl DeviceTree
         }
     }
 
-    /* pub fn to_blob() -> 
+    /* convert device tree into a binary blob
+       <= byte array containing the device tree blob */
+    pub fn to_blob(&self) -> Vec<u8>
     {
-
-    } */
+        Vec::new()
+    }
 }
 
 /* iterate over all properties in a node. note the return data per iteration:
