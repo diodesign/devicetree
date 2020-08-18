@@ -30,15 +30,17 @@
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::collections::btree_map::{self, BTreeMap};
 use core::mem::size_of;
 
-extern crate qemuprint;
-
 extern crate hashbrown;
-use hashbrown::hash_map::{HashMap, Iter};
+use hashbrown::hash_map::{HashMap, self};
 
 extern crate byterider;
 use byterider::{Bytes, Ordering};
+
+/* for debugging on Qemu */
+extern crate qemuprint;
 
 /* we support any DTB backwards compatible to this spec version number */
 const LOWEST_SUPPORTED_VERSION: u32 = 16; 
@@ -110,7 +112,7 @@ impl DeviceTreeBlob
     /* return true if this looks like legit DTB data, or false if not */
     pub fn valid_magic_check(&self) -> bool
     {
-        if u32::from_be(self.magic) != DTB_MAGIC || u32::from_be(self.last_comp_version) > LOWEST_SUPPORTED_VERSION
+        if self.magic != DTB_MAGIC || self.last_comp_version > LOWEST_SUPPORTED_VERSION
         {
             return false;
         }
@@ -126,7 +128,7 @@ impl DeviceTreeBlob
     {
         let mut bytes = Bytes::from_slice(blob);
         bytes.set_ordering(Ordering::BigEndian); /* device tree blobs are stored in BE */
-
+        
         let dtb = DeviceTreeBlob
         {
             magic:              bytes.read_word(0 * 4).unwrap(),
@@ -158,7 +160,7 @@ impl DeviceTreeBlob
 
         let mut dt = DeviceTree::new();
 
-        let mut offset = u32::from_be(self.off_dt_struct) as usize;
+        let mut offset = self.off_dt_struct as usize;
         let mut path = Vec::<String>::new();
 
         /* walk through the tokens in the blob. offset is automatically incremented
@@ -202,7 +204,7 @@ impl DeviceTreeBlob
 
         let token = match self.bytes.read_word(*offset)
         {
-            Some(t) => u32::from_be(t),
+            Some(t) => t,
             None => return Err(DeviceTreeError::ReachedUnexpectedEnd) /* stop parsing when out of bounds */
         };
 
@@ -242,14 +244,14 @@ impl DeviceTreeBlob
                 align_to_next_u32!(*offset);
                 let length = match self.bytes.read_word(*offset)
                 {
-                    Some(l) => u32::from_be(l),
+                    Some(l) => l,
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
                 align_to_next_u32!(*offset);
                 let string_offset = match self.bytes.read_word(*offset)
                 {
-                    Some(so) => u32::from_be(so),
+                    Some(so) => so,
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
@@ -296,7 +298,7 @@ impl DeviceTreeBlob
                 return Ok(DeviceTreeBlobTokenParsed
                 {
                     full_path: full_path,
-                    property: self.get_string((string_offset + u32::from_be(self.off_dt_strings)) as usize),
+                    property: self.get_string((string_offset + self.off_dt_strings) as usize),
                     value: value
                 });
             },
@@ -487,11 +489,8 @@ pub struct AddressSizeCells
 /* parsed device tree */
 pub struct DeviceTree
 {
-    /* store the tree in a hash table as we usually either iterate over all entries,
-    or wish to find a specific entry. searching the table is not likely to be used
-    in time critical cases. if this needs to be optimized, submit a patch or open
-    an issue with a suggested way forward. */
-    entries: HashMap<String, HashMap<String, DeviceTreeProperty>>
+    /* store nodes in a tree, each node has a hash table of properties and values */
+    nodes: BTreeMap<String, HashMap<String, DeviceTreeProperty>>
 }
 
 impl DeviceTree
@@ -501,7 +500,7 @@ impl DeviceTree
     {
         DeviceTree
         {
-            entries: HashMap::new()
+            nodes: BTreeMap::new()
         }
     }
 
@@ -513,7 +512,7 @@ impl DeviceTree
     */
     pub fn edit_property(&mut self, node_path: &String, label: &String, value: DeviceTreeProperty)
     {
-        if let Some(node) = self.entries.get_mut(node_path)
+        if let Some(node) = self.nodes.get_mut(node_path)
         {
             node.insert(label.clone(), value);
         }
@@ -521,7 +520,7 @@ impl DeviceTree
         {
             let mut properties = HashMap::<String, DeviceTreeProperty>::new();
             properties.insert(label.clone(), value);
-            self.entries.insert(node_path.clone(), properties);
+            self.nodes.insert(node_path.clone(), properties);
         }
     }
 
@@ -532,7 +531,7 @@ impl DeviceTree
     */
     pub fn delete_property(&mut self, node_path: &String, label: &String) -> Option<DeviceTreeProperty>
     {
-        if let Some(node) = self.entries.get_mut(node_path)
+        if let Some(node) = self.nodes.get_mut(node_path)
         {
             return node.remove(label)
         }
@@ -584,7 +583,7 @@ impl DeviceTree
     */
     pub fn get_property(&self, node_path: &String, label: &String) -> Result<&DeviceTreeProperty, DeviceTreeError>
     {
-        if let Some(node) = self.entries.get(node_path)
+        if let Some(node) = self.nodes.get(node_path)
         {
             if let Some(property) = node.get(label)
             {
@@ -601,7 +600,7 @@ impl DeviceTree
           each iteration returns a tuple of (property name string, property value) */
     pub fn property_iter(&self, node_path: &String) -> Option<DeviceTreePropertyIter>
     {
-        match self.entries.get(node_path)
+        match self.nodes.get(node_path)
         {
             Some(node) => Some(DeviceTreePropertyIter
             {
@@ -616,7 +615,7 @@ impl DeviceTree
     */
     pub fn delete_node(&mut self, node_path: &String)
     {
-        self.entries.remove(node_path);
+        self.nodes.remove(node_path);
     }
 
     /* detect that a node exists. the given path must be in full and canonical
@@ -624,7 +623,7 @@ impl DeviceTree
     */
     pub fn node_exists(&self, node_path: &String) -> bool
     {
-        self.entries.get(node_path).is_some()
+        self.nodes.get(node_path).is_some()
     }
 
     /* return an iterator of all node paths matching the given path.
@@ -640,7 +639,7 @@ impl DeviceTree
         {
             depth: depth,
             to_match: node_path_search.clone(),
-            iter: self.entries.iter()
+            iter: self.nodes.iter()
         }
     }
 
@@ -650,6 +649,17 @@ impl DeviceTree
     {
         let mut bytes = Bytes::new();
         bytes.set_ordering(Ordering::BigEndian);
+
+        qemuprint::println!("tree contents:\n");
+        for (path, content) in self.nodes.iter()
+        {
+            qemuprint::println!("node: {}", path);
+            for (property, value) in content.iter()
+            {
+                qemuprint::println!("{} = {:?}", property, value);
+            }
+            qemuprint::println!("");
+        }
 
         /* write out metadata */
         bytes.add_word(DTB_MAGIC);
@@ -665,7 +675,7 @@ impl DeviceTree
    and DeviceTreeProperty contains the property value */
 pub struct DeviceTreePropertyIter<'a>
 {
-    iter: Iter<'a, alloc::string::String, DeviceTreeProperty>
+    iter: hash_map::Iter<'a, alloc::string::String, DeviceTreeProperty>
 }
 
 impl Iterator for DeviceTreePropertyIter<'_>
@@ -690,7 +700,7 @@ pub struct DeviceTreeIter<'a>
 {
     depth: DeviceTreeIterDepth,
     to_match: String,
-    iter: Iter<'a, String, HashMap<String, DeviceTreeProperty>>
+    iter: btree_map::Iter<'a, String, hash_map::HashMap<String, DeviceTreeProperty>>
 }
 
 impl Iterator for DeviceTreeIter<'_>
