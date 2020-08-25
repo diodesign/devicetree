@@ -43,7 +43,7 @@ use byterider::{Bytes, Ordering};
 extern crate qemuprint;
 
 /* we support any DTB backwards compatible to this spec version number */
-const LOWEST_SUPPORTED_VERSION: u32 = 16;
+const LOWEST_SUPPORTED_VERSION: u32 = 2;
 const DTB_VERSION: u32 = 17; /* follow version 17 of the DT specification */
 
 /* DTB token ID numbers, hardwired into the spec */
