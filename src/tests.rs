@@ -160,3 +160,41 @@ fn stdout_defined()
     assert!(check_stdout(&trees.rv32));
     assert!(check_stdout(&trees.rv64));
 }
+
+#[test]
+fn test_own_dtb()
+{
+    /* load DTBs from disk and parse them into trees */
+    let trees = DeviceTrees::new();
+
+    /* then convert trees back into blobs using our code */
+    let rv32_dtb_bytes = trees.rv32.to_blob();
+    let rv64_dtb_bytes = trees.rv32.to_blob();
+    assert_eq!(rv32_dtb_bytes.is_ok(), true);
+    assert_eq!(rv64_dtb_bytes.is_ok(), true);
+
+    let rv32_dtb = DeviceTreeBlob::from_slice(rv32_dtb_bytes.unwrap().as_slice());
+    let rv64_dtb = DeviceTreeBlob::from_slice(rv64_dtb_bytes.unwrap().as_slice());
+    assert_eq!(rv32_dtb.is_ok(), true);
+    assert_eq!(rv64_dtb.is_ok(), true);
+
+    /* now parse them again from DTB to trees to test our DTB generation code is sound */
+    let rv32_parsed = rv32_dtb.unwrap().to_parsed();
+    let rv64_parsed = rv64_dtb.unwrap().to_parsed();
+    assert_eq!(rv32_parsed.is_ok(), true);
+    assert_eq!(rv64_parsed.is_ok(), true);
+
+    let rv32_parsed = rv32_parsed.unwrap();
+    let rv64_parsed = rv64_parsed.unwrap();
+
+    /* perform checks */
+    /* should be two CPU cores each */
+    assert!(count_cpu_cores(&rv32_parsed) == 2);
+    assert!(count_cpu_cores(&rv64_parsed) == 2);
+    /* should be 128MiB of RAM each */
+    assert!(count_ram(&rv32_parsed) == 128 * 1024 * 1024);
+    assert!(count_ram(&rv64_parsed) == 128 * 1024 * 1024);
+    /* stdout should point to a serial device */
+    assert!(check_stdout(&rv32_parsed));
+    assert!(check_stdout(&rv64_parsed));
+}

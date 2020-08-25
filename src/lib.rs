@@ -30,17 +30,21 @@
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
-
+use alloc::collections::btree_map::{self, BTreeMap};
 use core::mem::size_of;
 
 extern crate hashbrown;
-use hashbrown::hash_map::{HashMap, Iter};
+use hashbrown::hash_map::{HashMap, self};
 
 extern crate byterider;
 use byterider::{Bytes, Ordering};
 
+/* for debugging on Qemu */
+extern crate qemuprint;
+
 /* we support any DTB backwards compatible to this spec version number */
-const LOWEST_SUPPORTED_VERSION: u32 = 16; 
+const LOWEST_SUPPORTED_VERSION: u32 = 2;
+const DTB_VERSION: u32 = 17; /* follow version 17 of the DT specification */
 
 /* DTB token ID numbers, hardwired into the spec */
 const FDT_BEGIN_NODE:   u32 = 0x00000001;
@@ -48,6 +52,9 @@ const FDT_END_NODE:     u32 = 0x00000002;
 const FDT_PROP:         u32 = 0x00000003;
 const FDT_NOP:          u32 = 0x00000004;
 const FDT_END:          u32 = 0x00000009;
+
+/* DTB header magic numbers */
+const DTB_MAGIC: u32 = 0xd00dfeed;
 
 /* defaults for #address-cells and #size-cells from the specification */
 const DEFAULTADDRESSCELLS: usize = 2;
@@ -75,10 +82,12 @@ pub enum DeviceTreeError
     TokenUnaligned,
     SkippedToken,
     BadToken(u32),
+    MissingRootNode,
 
     /* device tree processing */
     NotFound,
     WidthUnsupported,
+    OutOfBoundsWrite
 }
 
 /* define the header for a raw device tree blob */
@@ -106,7 +115,7 @@ impl DeviceTreeBlob
     /* return true if this looks like legit DTB data, or false if not */
     pub fn valid_magic_check(&self) -> bool
     {
-        if u32::from_be(self.magic) != 0xd00dfeed || u32::from_be(self.last_comp_version) > LOWEST_SUPPORTED_VERSION
+        if self.magic != DTB_MAGIC || self.last_comp_version > LOWEST_SUPPORTED_VERSION
         {
             return false;
         }
@@ -122,19 +131,19 @@ impl DeviceTreeBlob
     {
         let mut bytes = Bytes::from_slice(blob);
         bytes.set_ordering(Ordering::BigEndian); /* device tree blobs are stored in BE */
-
+        
         let dtb = DeviceTreeBlob
         {
-            magic:              bytes.read_word(0 * 4).unwrap(),
-            totalsize:          bytes.read_word(1 * 4).unwrap(),
-            off_dt_struct:      bytes.read_word(2 * 4).unwrap(),
-            off_dt_strings:     bytes.read_word(3 * 4).unwrap(),
-            off_mem_rsvmap:     bytes.read_word(4 * 4).unwrap(),
-            version:            bytes.read_word(5 * 4).unwrap(),
-            last_comp_version:  bytes.read_word(6 * 4).unwrap(),
-            boot_cpuid_phys:    bytes.read_word(7 * 4).unwrap(),
-            size_dt_strings:    bytes.read_word(8 * 4).unwrap(),
-            size_dt_struct:     bytes.read_word(9 * 4).unwrap(),
+            magic:              bytes.read_u32(0 * 4).unwrap(),
+            totalsize:          bytes.read_u32(1 * 4).unwrap(),
+            off_dt_struct:      bytes.read_u32(2 * 4).unwrap(),
+            off_dt_strings:     bytes.read_u32(3 * 4).unwrap(),
+            off_mem_rsvmap:     bytes.read_u32(4 * 4).unwrap(),
+            version:            bytes.read_u32(5 * 4).unwrap(),
+            last_comp_version:  bytes.read_u32(6 * 4).unwrap(),
+            boot_cpuid_phys:    bytes.read_u32(7 * 4).unwrap(),
+            size_dt_strings:    bytes.read_u32(8 * 4).unwrap(),
+            size_dt_struct:     bytes.read_u32(9 * 4).unwrap(),
             bytes:              bytes
         };
 
@@ -154,7 +163,7 @@ impl DeviceTreeBlob
 
         let mut dt = DeviceTree::new();
 
-        let mut offset = u32::from_be(self.off_dt_struct) as usize;
+        let mut offset = self.off_dt_struct as usize;
         let mut path = Vec::<String>::new();
 
         /* walk through the tokens in the blob. offset is automatically incremented
@@ -196,9 +205,9 @@ impl DeviceTreeBlob
             return Err(DeviceTreeError::TokenUnaligned)
         }
 
-        let token = match self.bytes.read_word(*offset)
+        let token = match self.bytes.read_u32(*offset)
         {
-            Some(t) => u32::from_be(t),
+            Some(t) => t,
             None => return Err(DeviceTreeError::ReachedUnexpectedEnd) /* stop parsing when out of bounds */
         };
 
@@ -236,16 +245,16 @@ impl DeviceTreeBlob
                 and then a 32-bit offset into the string table for the property's name.
                 then follows length number of bytes of data belonging to the property */
                 align_to_next_u32!(*offset);
-                let length = match self.bytes.read_word(*offset)
+                let length = match self.bytes.read_u32(*offset)
                 {
-                    Some(l) => u32::from_be(l),
+                    Some(l) => l,
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
                 align_to_next_u32!(*offset);
-                let string_offset = match self.bytes.read_word(*offset)
+                let string_offset = match self.bytes.read_u32(*offset)
                 {
-                    Some(so) => u32::from_be(so),
+                    Some(so) => so,
                     None => return Err(DeviceTreeError::ReachedUnexpectedEnd)
                 };
 
@@ -260,7 +269,7 @@ impl DeviceTreeBlob
                         let mut array = Vec::<u8>::new();
                         for _ in 0..length
                         {
-                            if let Some(byte) = self.bytes.read_byte(*offset)
+                            if let Some(byte) = self.bytes.read_u8(*offset)
                             {
                                 array.push(byte);
                                 align_to_next_u8!(*offset);
@@ -292,7 +301,7 @@ impl DeviceTreeBlob
                 return Ok(DeviceTreeBlobTokenParsed
                 {
                     full_path: full_path,
-                    property: self.get_string((string_offset + u32::from_be(self.off_dt_strings)) as usize),
+                    property: self.get_string((string_offset + self.off_dt_strings) as usize),
                     value: value
                 });
             },
@@ -325,7 +334,7 @@ impl DeviceTreeBlob
         subsequent parameters. */
         loop
         {
-            match self.bytes.read_byte(offset + count)
+            match self.bytes.read_u8(offset + count)
             {
                 Some(c) => match c
                 {
@@ -338,7 +347,7 @@ impl DeviceTreeBlob
                         align_to_next_u8!(count);
                     }
                 },
-                None => break
+                None => break 
             }
         }
 
@@ -377,6 +386,75 @@ pub enum DeviceTreeProperty
 
 impl DeviceTreeProperty
 {
+    /* get the raw size of a property when stored in memory */
+    pub fn size(&self) -> usize
+    {
+        match self
+        {
+            DeviceTreeProperty::Empty => 0,
+            DeviceTreeProperty::Bytes(v) => v.len(),
+            DeviceTreeProperty::MultipleUnsignedInt64_64(v) => v.len() * 2 * size_of::<u64>(),
+            DeviceTreeProperty::MultipleUnsignedInt64_32(v) => v.len() * (size_of::<u64>() + size_of::<u32>()),
+            DeviceTreeProperty::MultipleUnsignedInt32_32(v) => v.len() * 2 * size_of::<u32>(),
+            DeviceTreeProperty::MultipleUnsignedInt64(v) => v.len() * size_of::<u64>(),
+            DeviceTreeProperty::MultipleUnsignedInt32(v) => v.len() * size_of::<u64>(),
+            DeviceTreeProperty::UnsignedInt32(_) => size_of::<u32>(),
+            DeviceTreeProperty::Text(s) => s.len(),
+            DeviceTreeProperty::MultipleText(v) =>
+            {
+                let mut total = 0;
+                for s in v
+                {
+                    total = total + s.len();
+                }
+                total
+            }
+        }
+    }
+
+    /* write out the contents of property to the given byte array.
+    use the correct word endianness when writing words of data to the array */
+    pub fn copy_to_mem(&self, bytes: &mut Bytes)
+    {
+        match self
+        {
+            DeviceTreeProperty::Empty => (),
+            DeviceTreeProperty::Bytes(v) => for b in v
+            {
+                bytes.add_u8(*b);
+            },
+            DeviceTreeProperty::MultipleUnsignedInt64_64(v) => for (i, j) in v
+            {
+                bytes.add_u64(*i);
+                bytes.add_u64(*j);
+            },
+            DeviceTreeProperty::MultipleUnsignedInt64_32(v) => for (i, j) in v
+            {
+                bytes.add_u64(*i);
+                bytes.add_u32(*j);
+            },
+            DeviceTreeProperty::MultipleUnsignedInt32_32(v) => for (i, j) in v
+            {
+                bytes.add_u32(*i);
+                bytes.add_u32(*j);
+            },
+            DeviceTreeProperty::MultipleUnsignedInt64(v) => for w in v
+            {
+                bytes.add_u64(*w);
+            },
+            DeviceTreeProperty::MultipleUnsignedInt32(v)  => for w in v
+            {
+                bytes.add_u32(*w);
+            },
+            DeviceTreeProperty::UnsignedInt32(w) => bytes.add_u32(*w),
+            DeviceTreeProperty::Text(s) => bytes.add_null_term_string((*s).as_str()),
+            DeviceTreeProperty::MultipleText(v) => for s in v
+            {
+                bytes.add_null_term_string((*s).as_str());
+            }
+        }
+    }
+
     /* convert array of bytes into Rust vector of whole 64-bit words */
     pub fn as_multi_u64(&self) -> Result<Vec<u64>, DeviceTreeError>
     {
@@ -480,14 +558,26 @@ pub struct AddressSizeCells
     pub size: usize     /* number of unsigned 32-bit cells to hold a size */
 }
 
+#[derive(PartialEq, Eq, Clone)]
+enum DeviceTreeReference
+{
+    TotalSize,
+    OffsetDTStruct,
+    OffsetDTStrings,
+    OffsetMemoryReservation,
+    SizeDTStrings,
+    SizeDTStruct,
+    PropertyName(String)
+}
+
 /* parsed device tree */
 pub struct DeviceTree
 {
-    /* store the tree in a hash table as we usually either iterate over all entries,
-    or wish to find a specific entry. searching the table is not likely to be used
-    in time critical cases. if this needs to be optimized, submit a patch or open
-    an issue with a suggested way forward. */
-    entries: HashMap<String, HashMap<String, DeviceTreeProperty>>
+    /* store nodes in a tree, each node has a hash table of properties and values */
+    nodes: BTreeMap<String, HashMap<String, DeviceTreeProperty>>,
+
+    /* specify the boot CPU ID (or it defaults to 0) */
+    boot_cpu_id: u32
 }
 
 impl DeviceTree
@@ -497,8 +587,15 @@ impl DeviceTree
     {
         DeviceTree
         {
-            entries: HashMap::new()
+            nodes: BTreeMap::new(),
+            boot_cpu_id: 0
         }
+    }
+
+    /* define the system's boot CPU ID, which defaults to 0 */
+    pub fn set_boot_cpu_id(&mut self, cpu_id: u32)
+    {
+        self.boot_cpu_id = cpu_id;
     }
 
     /* add or update a property in a node. if the node doesn't exist, it's created.
@@ -509,7 +606,7 @@ impl DeviceTree
     */
     pub fn edit_property(&mut self, node_path: &String, label: &String, value: DeviceTreeProperty)
     {
-        if let Some(node) = self.entries.get_mut(node_path)
+        if let Some(node) = self.nodes.get_mut(node_path)
         {
             node.insert(label.clone(), value);
         }
@@ -517,7 +614,7 @@ impl DeviceTree
         {
             let mut properties = HashMap::<String, DeviceTreeProperty>::new();
             properties.insert(label.clone(), value);
-            self.entries.insert(node_path.clone(), properties);
+            self.nodes.insert(node_path.clone(), properties);
         }
     }
 
@@ -528,7 +625,7 @@ impl DeviceTree
     */
     pub fn delete_property(&mut self, node_path: &String, label: &String) -> Option<DeviceTreeProperty>
     {
-        if let Some(node) = self.entries.get_mut(node_path)
+        if let Some(node) = self.nodes.get_mut(node_path)
         {
             return node.remove(label)
         }
@@ -580,7 +677,7 @@ impl DeviceTree
     */
     pub fn get_property(&self, node_path: &String, label: &String) -> Result<&DeviceTreeProperty, DeviceTreeError>
     {
-        if let Some(node) = self.entries.get(node_path)
+        if let Some(node) = self.nodes.get(node_path)
         {
             if let Some(property) = node.get(label)
             {
@@ -597,7 +694,7 @@ impl DeviceTree
           each iteration returns a tuple of (property name string, property value) */
     pub fn property_iter(&self, node_path: &String) -> Option<DeviceTreePropertyIter>
     {
-        match self.entries.get(node_path)
+        match self.nodes.get(node_path)
         {
             Some(node) => Some(DeviceTreePropertyIter
             {
@@ -612,7 +709,7 @@ impl DeviceTree
     */
     pub fn delete_node(&mut self, node_path: &String)
     {
-        self.entries.remove(node_path);
+        self.nodes.remove(node_path);
     }
 
     /* detect that a node exists. the given path must be in full and canonical
@@ -620,7 +717,7 @@ impl DeviceTree
     */
     pub fn node_exists(&self, node_path: &String) -> bool
     {
-        self.entries.get(node_path).is_some()
+        self.nodes.get(node_path).is_some()
     }
 
     /* return an iterator of all node paths matching the given path.
@@ -636,15 +733,247 @@ impl DeviceTree
         {
             depth: depth,
             to_match: node_path_search.clone(),
-            iter: self.entries.iter()
+            iter: self.nodes.iter()
         }
     }
 
     /* convert device tree into a binary blob
-       <= byte array containing the device tree blob */
-    pub fn to_blob(&self) -> Vec<u8>
+       <= byte array containing the device tree blob, or error code */
+    pub fn to_blob(&self) -> Result<Vec<u8>, DeviceTreeError>
     {
-        Vec::new()
+        let mut bytes = Bytes::new();
+        bytes.set_ordering(Ordering::BigEndian);
+
+        /* keep track of offsets and sizes we need to plug into the
+        DTB when we're aware of the values */
+        let mut references = BTreeMap::<usize, DeviceTreeReference>::new();
+
+        /* write out metadata */
+        bytes.add_u32(DTB_MAGIC);
+        self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::TotalSize);
+        self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetDTStruct);
+        self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetDTStrings);
+        self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetMemoryReservation);
+        bytes.add_u32(DTB_VERSION); /* specification version */
+        bytes.add_u32(LOWEST_SUPPORTED_VERSION); /* minimuum supported version */
+        bytes.add_u32(self.boot_cpu_id); /* boot_cpuid_phys */
+        self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::SizeDTStrings);
+        self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::SizeDTStruct);
+
+        /* create an empty reserved memory area. TODO: create a proper reserved area list */
+        let pos = bytes.offset32();
+        self.resolve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetMemoryReservation, pos)?;
+        bytes.add_u64(0); /* reserved mem address. 0 = end list*/
+        bytes.add_u64(0); /* reserved mem size. 0 = end list */
+
+        /* keep track of the nodes we've already created in the DTB */
+        let mut prev_nodes = Vec::<&str>::new();
+
+        /* start creating nodes. the node paths should be in order when iter'ing them. essentially we
+        have to turn a tree of strings (with their associated properties) like this:
+
+        /
+        /chosen
+        /cpus
+        /cpus/cpu@0
+        /cpus/cpu@1
+        /memory@....
+        /uart@...
+        
+        into this in the DTB:
+
+        BEGIN NODE ''
+            BEGIN NODE 'chosen'
+            END NODE
+            BEGIN NODE 'cpus'
+                BEGIN NODE 'cpu@0'
+                END NODE
+                BEGIN NODE 'cpu@1'
+                END NODE
+            END NODE
+            BEGIN NODE 'memory@....'
+            END NODE
+            BEGIN NODE 'uart@...'
+            END NODE
+        END NODE
+
+        In the case of:
+
+        /cpus/cpu@1
+        /memory@....
+
+        We need to end the nodes of cpu@1 and cpus before creating memory@... */
+        let dtstruct_start = bytes.offset32();
+        self.resolve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetDTStruct, dtstruct_start)?;
+
+        for (path, properties) in self.nodes.iter()
+        {
+            /* break the path string up into nodes split by the separator */
+            let nodes: Vec<&str> = path.split(DEVICETREESEPARATOR).collect();
+
+            /* loop through the nodes in the tree string. skip index 0 as it's always ''.
+            eg, /chosen splits into '' and 'chosen'. */
+            for index in 1..nodes.len()
+            {
+                /* check to see if this is a new node or one we've created before */
+                match &prev_nodes.get(index)
+                {
+                    /* is this is a node we've not seen before in this position? */
+                    Some(previous) => if **previous != nodes[index]
+                    {
+                        /* we're switching to a new node. close all child nodes,
+                        eg if the previous nodes were: /cpus/cpu@8 and the next
+                        string is /uart@1000 then close off cpu@8 then cpus before
+                        creating uart@1000 */
+                        loop
+                        {
+                            if prev_nodes.len() <= index
+                            {
+                                break;
+                            } 
+                            bytes.add_u32(FDT_END_NODE);
+                            prev_nodes.pop();
+                        }
+
+                        bytes.add_u32(FDT_BEGIN_NODE);
+                        bytes.add_null_term_string(nodes[index]);
+                        bytes.pad_to_u32();
+
+                        prev_nodes.insert(prev_nodes.len(), nodes[index]);
+                    },
+                    /* no previous node in this position in the tree string so create a new node */
+                    None =>
+                    {
+                        bytes.add_u32(FDT_BEGIN_NODE);
+                        bytes.add_null_term_string(nodes[index]);
+                        bytes.pad_to_u32();
+
+                        prev_nodes.insert(prev_nodes.len(), nodes[index]);
+                    }
+                }
+            }
+
+            /* list the proeprties for this node, reserving a 32-bit word for
+            the offset into tne string of property names */
+            for (name, property) in properties
+            {
+                let size = property.size();
+                bytes.add_u32(FDT_PROP);
+                bytes.add_u32(size as u32);
+                self.reserve_reference(&mut bytes, &mut references,
+                    DeviceTreeReference::PropertyName(name.clone()));
+                property.copy_to_mem(&mut bytes);
+                bytes.pad_to_u32();
+            }
+        }
+
+        /* close all outstanding nodes and end the node structure */
+        for _ in prev_nodes
+        {
+            bytes.add_u32(FDT_END_NODE);
+        }
+        bytes.add_u32(FDT_END);
+
+        let dtstruct_end = bytes.offset32();
+        self.resolve_reference(&mut bytes, &mut references,
+            DeviceTreeReference::SizeDTStruct, dtstruct_end - dtstruct_start)?;
+        
+        /* resolve strings here */
+        let dtstrings_start = dtstruct_end;
+        self.resolve_reference(&mut bytes, &mut references,
+                DeviceTreeReference::OffsetDTStrings, dtstrings_start)?;
+
+        self.resolve_name_strings(&mut bytes, &mut references)?;
+
+        let dtstrings_end = bytes.offset32();
+        self.resolve_reference(&mut bytes, &mut references,
+            DeviceTreeReference::SizeDTStrings, dtstrings_end - dtstrings_start)?;
+
+        /* write in the final size - we're all done */
+        let totalsize = bytes.len() as u32;
+        self.resolve_reference(&mut bytes, &mut references,
+            DeviceTreeReference::TotalSize, totalsize)?;
+
+        Ok(bytes.as_vec())
+    }
+
+    /* reserve a 32-bit word in a byte array which will be filled with an offset to
+    some other data or a size. call resolve_reference() to fill in the info.
+    => bytes = Bytes array to update
+       map = data structure that associates references to offsets in the bytes array
+       reference = label for the information to be filled in later */
+    fn reserve_reference(&self, bytes: &mut Bytes, map: &mut BTreeMap<usize, DeviceTreeReference>, reference: DeviceTreeReference)
+    {
+        map.insert(bytes.len(), reference);
+        bytes.add_u32(0);
+    }
+
+    /* find all words reserved in the byte array for the given reference and fill in the given value.
+    this will remove that reference from the data structure so it cannot be resolved again.
+    if an out-of-bounds write is attempted, this function will exit immediately
+    with the error code OutOfBoundsWrite
+    => bytes = Bytes array to update
+       map = data structure that associates references to offsets in the bytes array
+       to_match = label for the information to be filled in
+       value = information (an offset or a size) to replace the reserved word
+    <= OK if successful, or an error */
+    fn resolve_reference(&self, bytes: &mut Bytes, map: &mut BTreeMap<usize, DeviceTreeReference>,
+        to_match: DeviceTreeReference, value: u32) -> Result<(), DeviceTreeError>
+    {
+        let mut to_remove = Vec::new();
+
+        /* yes, we have to enumerate all offsets but that's because offsets are unique
+        and references may or may not. we also remove all matches so the map gets smaller
+        the more resolve_reference() is called */
+        for (offset, reference) in map.into_iter()
+        {
+            if to_match == *reference
+            {
+                match bytes.alter_u32(*offset, value)
+                {
+                    true => to_remove.push(*offset),
+                    false =>  return Err(DeviceTreeError::OutOfBoundsWrite)
+                }
+            }
+        }
+
+        for victim in to_remove
+        {
+            map.remove_entry(&victim);
+        }
+        Ok(())
+    }
+
+    /* go through references to property names, add them to the bytes array (forming the block of name strings)
+    and write the offset into the reserved word for the property's name */
+    fn resolve_name_strings(&self, bytes: &mut Bytes, map: &mut BTreeMap<usize, DeviceTreeReference>) -> Result<(), DeviceTreeError>
+    {
+        let mut to_remove = Vec::new();
+        let base = bytes.len();
+
+        for (offset, reference) in map.into_iter()
+        {
+            match reference
+            {
+                DeviceTreeReference::PropertyName(s) =>
+                {
+                    let pos = bytes.len();
+                    bytes.add_null_term_string(s);
+                    match bytes.alter_u32(*offset, (pos - base) as u32)
+                    {
+                        true => to_remove.push(*offset),
+                        false =>  return Err(DeviceTreeError::OutOfBoundsWrite)
+                    }
+                },
+                _ => ()
+            }
+        }
+
+        for victim in to_remove
+        {
+            map.remove_entry(&victim);
+        }
+        Ok(())
     }
 }
 
@@ -653,7 +982,7 @@ impl DeviceTree
    and DeviceTreeProperty contains the property value */
 pub struct DeviceTreePropertyIter<'a>
 {
-    iter: Iter<'a, alloc::string::String, DeviceTreeProperty>
+    iter: hash_map::Iter<'a, alloc::string::String, DeviceTreeProperty>
 }
 
 impl Iterator for DeviceTreePropertyIter<'_>
@@ -678,7 +1007,7 @@ pub struct DeviceTreeIter<'a>
 {
     depth: DeviceTreeIterDepth,
     to_match: String,
-    iter: Iter<'a, String, HashMap<String, DeviceTreeProperty>>
+    iter: btree_map::Iter<'a, String, hash_map::HashMap<String, DeviceTreeProperty>>
 }
 
 impl Iterator for DeviceTreeIter<'_>

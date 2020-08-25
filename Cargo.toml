@@ -1,7 +1,7 @@
 [package]
 name = "devicetree"
 version = "0.0.1"
-authors = ["Chris Williams <diodesign@tuta.io>"]
+authors = ["Chris Williams <diosix@tuta.io>"]
 edition = "2018"
 
 [dependencies.hashbrown]
@@ -10,3 +10,6 @@ features = [ "nightly" ]
 
 [dependencies.byterider]
 path = "../byterider"
+
+[dependencies.qemuprint]
+path = "../qemuprint"
