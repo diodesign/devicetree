@@ -386,7 +386,9 @@ pub enum DeviceTreeProperty
 
 impl DeviceTreeProperty
 {
-    /* get the raw size of a property when stored in memory */
+    /* get the raw size of a property when stored in memory.
+    as per the specification, strings (Text) include a NULL byte
+    and a stringlist (MultipleText) has a single terminating NULL byte */
     pub fn size(&self) -> usize
     {
         match self
@@ -399,7 +401,7 @@ impl DeviceTreeProperty
             DeviceTreeProperty::MultipleUnsignedInt64(v) => v.len() * size_of::<u64>(),
             DeviceTreeProperty::MultipleUnsignedInt32(v) => v.len() * size_of::<u64>(),
             DeviceTreeProperty::UnsignedInt32(_) => size_of::<u32>(),
-            DeviceTreeProperty::Text(s) => s.len(),
+            DeviceTreeProperty::Text(s) => s.len() + 1, /* include NULL byte */
             DeviceTreeProperty::MultipleText(v) =>
             {
                 let mut total = 0;
@@ -407,7 +409,7 @@ impl DeviceTreeProperty
                 {
                     total = total + s.len();
                 }
-                total
+                total + 1 /* include the final NULL byte */
             }
         }
     }
@@ -905,7 +907,7 @@ impl DeviceTree
     fn reserve_reference(&self, bytes: &mut Bytes, map: &mut BTreeMap<usize, DeviceTreeReference>, reference: DeviceTreeReference)
     {
         map.insert(bytes.len(), reference);
-        bytes.add_u32(0);
+        bytes.add_u32(0xffffffff); /* set to a wild value to see it easily in debugging */
     }
 
     /* find all words reserved in the byte array for the given reference and fill in the given value.
