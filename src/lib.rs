@@ -837,6 +837,7 @@ impl DeviceTree
                             prev_nodes.pop();
                         }
 
+                        /* write node start marker and NULL-terminated string of the node's leafname */
                         bytes.add_u32(FDT_BEGIN_NODE);
                         bytes.add_null_term_string(nodes[index]);
                         bytes.pad_to_u32();
@@ -846,6 +847,7 @@ impl DeviceTree
                     /* no previous node in this position in the tree string so create a new node */
                     None =>
                     {
+                        /* write node start marker and NULL-terminated string of the node's leafname */
                         bytes.add_u32(FDT_BEGIN_NODE);
                         bytes.add_null_term_string(nodes[index]);
                         bytes.pad_to_u32();
