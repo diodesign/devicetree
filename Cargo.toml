@@ -10,6 +10,3 @@ features = [ "nightly" ]
 
 [dependencies.byterider]
 path = "../byterider"
-
-[dependencies.qemuprint]
-path = "../qemuprint"

@@ -39,9 +39,6 @@ use hashbrown::hash_map::{HashMap, self};
 extern crate byterider;
 use byterider::{Bytes, Ordering};
 
-/* for debugging on Qemu */
-extern crate qemuprint;
-
 /* we support any DTB backwards compatible to this spec version number */
 const LOWEST_SUPPORTED_VERSION: u32 = 2;
 const DTB_VERSION: u32 = 17; /* follow version 17 of the DT specification */
@@ -300,9 +297,9 @@ impl DeviceTreeBlob
 
                 return Ok(DeviceTreeBlobTokenParsed
                 {
-                    full_path: full_path,
-                    property: self.get_string((string_offset + self.off_dt_strings) as usize),
-                    value: value
+                    full_path,
+                    value,
+                    property: self.get_string((string_offset + self.off_dt_strings) as usize)
                 });
             },
 
@@ -733,7 +730,7 @@ impl DeviceTree
     {
         DeviceTreeIter
         {
-            depth: depth,
+            depth,
             to_match: node_path_search.clone(),
             iter: self.nodes.iter()
         }
