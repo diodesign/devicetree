@@ -84,7 +84,8 @@ pub enum DeviceTreeError
     /* device tree processing */
     NotFound,
     WidthUnsupported,
-    OutOfBoundsWrite
+    OutOfBoundsWrite,
+    DeviceFailure
 }
 
 /* define the header for a raw device tree blob */
