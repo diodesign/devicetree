@@ -6,7 +6,7 @@ This crate is used by [Diosix](https://diosix.org) to boot a system, and to desc
 
 ### Contact and code of conduct <a name="contact"></a>
 
-Please [email](mailto:diosix@tuta.io) project lead Chris Williams if you have any questions or issues to raise, wish to get involved, have source to contribute, or have found a security flaw. You can, of course, submit pull requests or raise issues via GitHub, though please consider disclosing security-related matters privately. Please also observe the Diosix project's [code of conduct](https://diosix.org/docs/conduct.html) if you wish to participate.
+Please [email](mailto:chrisw@diosix.org) project lead Chris Williams if you have any questions or issues to raise, wish to get involved, have source to contribute, or have found a security flaw. You can, of course, submit pull requests or raise issues via GitHub, though please consider disclosing security-related matters privately. Please also observe the Diosix project's [code of conduct](https://diosix.org/docs/conduct.html) if you wish to participate.
 
 ### Copyright and license <a name="copyright"></a>
 
