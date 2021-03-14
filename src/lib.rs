@@ -40,7 +40,7 @@ extern crate byterider;
 use byterider::{Bytes, Ordering};
 
 /* we support any DTB backwards compatible to this spec version number */
-const LOWEST_SUPPORTED_VERSION: u32 = 2;
+const LAST_SUPPORTED_VERSION: u32 = 16;
 const DTB_VERSION: u32 = 17; /* follow version 17 of the DT specification */
 
 /* DTB token ID numbers, hardwired into the spec */
@@ -73,12 +73,13 @@ pub enum DeviceTreeError
 {
     /* DTB parsing errors */
     CannotConvert,
-    FailedMagicCheck,
+    BadMagic(u32, u32), /* values are: expected, actual */
+    UnsupportedVersion(u32, u32), /* values are: minimum supported version, actual version */
     ReachedEnd,
     ReachedUnexpectedEnd,
     TokenUnaligned,
     SkippedToken,
-    BadToken(u32),
+    BadToken(u32), /* value: the actual token */
     MissingRootNode,
 
     /* device tree processing */
@@ -110,15 +111,23 @@ pub struct DeviceTreeBlob
 
 impl DeviceTreeBlob
 {
-    /* return true if this looks like legit DTB data, or false if not */
-    pub fn valid_magic_check(&self) -> bool
+    /* return Ok if this appears to be legit DTB data, or an error code if not */
+    pub fn compatibility_check(&self) -> Result<(), DeviceTreeError>
     {
-        if self.magic != DTB_MAGIC || self.last_comp_version > LOWEST_SUPPORTED_VERSION
+        if self.magic != DTB_MAGIC
         {
-            return false;
+            return Err(DeviceTreeError::BadMagic(DTB_MAGIC, self.magic));
+        }
+        
+        if self.last_comp_version > LAST_SUPPORTED_VERSION
+        {
+            return Err(DeviceTreeError::UnsupportedVersion
+            (   
+                LAST_SUPPORTED_VERSION, self.last_comp_version)
+            );
         }
 
-        return true;
+        Ok(())
     }
 
     /* create a basic DeviceTreeBlob structure from a byte slice of a device tree blob.
@@ -145,10 +154,10 @@ impl DeviceTreeBlob
             bytes:              bytes
         };
 
-        match dtb.valid_magic_check()
+        match dtb.compatibility_check()
         {
-            true => Ok(dtb),
-            false => Err(DeviceTreeError::FailedMagicCheck)
+            Ok(()) => Ok(dtb),
+            Err(e) => Err(e)
         }
     }
 
@@ -156,8 +165,11 @@ impl DeviceTreeBlob
     => device tree structure, or error code for failure */
     pub fn to_parsed(&self) -> Result<DeviceTree, DeviceTreeError>
     {
-        /* force a magic check */
-        if self.valid_magic_check() == false { return Err(DeviceTreeError::FailedMagicCheck); }
+        /* force a magic and version check */
+        if let Err(e) = self.compatibility_check()
+        {
+            return Err(e);
+        }
 
         let mut dt = DeviceTree::new();
 
@@ -755,7 +767,7 @@ impl DeviceTree
         self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetDTStrings);
         self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::OffsetMemoryReservation);
         bytes.add_u32(DTB_VERSION); /* specification version */
-        bytes.add_u32(LOWEST_SUPPORTED_VERSION); /* minimuum supported version */
+        bytes.add_u32(LAST_SUPPORTED_VERSION); /* minimuum supported version */
         bytes.add_u32(self.boot_cpu_id); /* boot_cpuid_phys */
         self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::SizeDTStrings);
         self.reserve_reference(&mut bytes, &mut references, DeviceTreeReference::SizeDTStruct);
