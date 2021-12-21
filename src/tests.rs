@@ -4,7 +4,7 @@
  * 
  * TODO: Generate DTBs on the fly from qemu and parse them
  * 
- * (c) Chris Williams, 2020.
+ * (c) Chris Williams, 2020-2021.
  *
  * See LICENSE for usage and copying.
  */
@@ -13,51 +13,95 @@ use std::path::Path;
 use std::fs::read;
 use super::{DeviceTree, DeviceTreeBlob};
 
+/* describe a sample file and its config */
+struct SampleFile
+{
+    pub cpus: usize,
+    pub ram_size: usize,
+    pub filename: &'static str 
+}
+
+/* list of DTB samples we'll use to test */
+const SAMPLES: [SampleFile; 3] = [
+    SampleFile
+    {
+        cpus: 2,
+        ram_size: 128 * 1024 * 1024,
+        filename: "samples/qemu-rv32-virt-smp2-m128.dtb"
+    },
+    
+    SampleFile
+    {
+        cpus: 2,
+        ram_size: 128 * 1024 * 1024,
+        filename: "samples/qemu-rv64-virt-smp2-m128.dtb"
+    },
+
+    SampleFile
+    {
+        cpus: 4,
+        ram_size: 512 * 1024 * 1024,
+        filename: "samples/sifive-rv64-u-smp4-m512.dtb"
+    }
+];
+
+struct SampleDeviceTree
+{
+    pub cpus: usize,
+    pub ram_size: usize,
+    pub dt: DeviceTree   
+}
+
 struct DeviceTrees
 {
-    pub rv32: DeviceTree,
-    pub rv64: DeviceTree
+    parsed: Vec<SampleDeviceTree>
 }
 
 impl DeviceTrees
 {
     pub fn new() -> DeviceTrees
     {
-        let rv32_path = Path::new("samples/qemu-rv32-virt-smp2-m128.dtb");
-        let rv32_bytes = match read(&rv32_path)
-        {
-            Ok(bytes) => bytes,
-            Err(error_type) => panic!("Couldn't read contents of {}: {:?}", rv32_path.display(), error_type)
-        };
+        let mut trees: Vec<SampleDeviceTree> = Vec::new();
 
-        let rv64_path = Path::new("samples/qemu-rv64-virt-smp2-m128.dtb");
-        let rv64_bytes = match read(&rv64_path)
+        /* parse each of the sample files in SAMPLES and
+           store their trees and expected config values in
+           an array to pass back to the caller */
+        for sample in SAMPLES.iter()
         {
-            Ok(bytes) => bytes,
-            Err(error_type) => panic!("Couldn't read contents of {}: {:?}", rv64_path.display(), error_type)
-        };
+            match DeviceTreeBlob::from_slice(DeviceTrees::read_bytes(sample.filename).as_slice())
+            {
+                Ok(blob) => match blob.to_parsed()
+                {
+                    Ok(dt) => trees.push(SampleDeviceTree
+                    {
+                        cpus: sample.cpus,
+                        ram_size: sample.ram_size,
+                        dt: dt
+                    }),
+                    Err(error_type) => panic!("Couldn't parse device tree {}: {:?}", sample.filename, error_type)
+                },
+                Err(error_type) => panic!("Couldn't create blob from slice {}: {:?}", sample.filename, error_type)
+            }
+        }
 
         DeviceTrees
         {
-            rv32: match DeviceTreeBlob::from_slice(rv32_bytes.as_slice())
-            {
-                Ok(blob) => match blob.to_parsed()
-                {
-                    Ok(dt) => dt,
-                    Err(error_type) => panic!("Couldn't parse RV32 device tree: {:?}", error_type)
-                },
-                Err(error_type) => panic!("Couldn't create RV32 blob from slice: {:?}", error_type)
-            },
+            parsed: trees
+        }
+    }
 
-            rv64: match DeviceTreeBlob::from_slice(rv64_bytes.as_slice())
-            {
-                Ok(blob) => match blob.to_parsed()
-                {
-                    Ok(dt) => dt,
-                    Err(error_type) => panic!("Couldn't parse RV64 device tree: {:?}", error_type)
-                },
-                Err(error_type) => panic!("Couldn't create RV64 blob from slice: {:?}", error_type)
-            }
+    pub fn iter(&self) -> std::slice::Iter<'_, SampleDeviceTree>
+    {
+        self.parsed.iter()
+    }
+
+    pub fn read_bytes(filename: &str) -> Vec<u8>
+    {
+        let path = Path::new(filename);
+        match read(&path)
+        {
+            Ok(bytes) => bytes,
+            Err(error_type) => panic!("Couldn't read contents of {}: {:?}", path.display(), error_type)
         }
     }
 }
@@ -137,28 +181,31 @@ fn check_stdout(tree: &DeviceTree) -> bool
 #[test]
 fn cpu_core_count()
 {
-    /* ensure all cores are found: 2 in total */
-    let trees = DeviceTrees::new();
-    assert!(count_cpu_cores(&trees.rv32) == 2);
-    assert!(count_cpu_cores(&trees.rv64) == 2);
+    /* ensure all cores are found */
+    for tree in DeviceTrees::new().iter()
+    {
+        assert!(count_cpu_cores(&tree.dt) == tree.cpus);    
+    }
 }
 
 #[test]
 fn ram_count()
 {
-    /* ensure all RAM is accounted for: 128MiB in total */
-    let trees = DeviceTrees::new();
-    assert!(count_ram(&trees.rv32) == 128 * 1024 * 1024);
-    assert!(count_ram(&trees.rv64) == 128 * 1024 * 1024);
+    /* ensure all RAM is accounted for */
+    for tree in DeviceTrees::new().iter()
+    {
+        assert!(count_ram(&tree.dt) == tree.ram_size);    
+    }
 }
 
 #[test]
 fn stdout_defined()
 {
     /* ensure stdout points to a serial port device */
-    let trees = DeviceTrees::new();
-    assert!(check_stdout(&trees.rv32));
-    assert!(check_stdout(&trees.rv64));
+    for tree in DeviceTrees::new().iter()
+    {
+        assert!(check_stdout(&tree.dt));    
+    }
 }
 
 #[test]
@@ -167,34 +214,29 @@ fn test_own_dtb()
     /* load DTBs from disk and parse them into trees */
     let trees = DeviceTrees::new();
 
-    /* then convert trees back into blobs using our code */
-    let rv32_dtb_bytes = trees.rv32.to_blob();
-    let rv64_dtb_bytes = trees.rv32.to_blob();
-    assert_eq!(rv32_dtb_bytes.is_ok(), true);
-    assert_eq!(rv64_dtb_bytes.is_ok(), true);
+    for tree in trees.iter()
+    {
+        /* then convert trees back into blobs using our code */
+        let bytes = tree.dt.to_blob();
+        assert_eq!(bytes.is_ok(), true);
 
-    let rv32_dtb = DeviceTreeBlob::from_slice(rv32_dtb_bytes.unwrap().as_slice());
-    let rv64_dtb = DeviceTreeBlob::from_slice(rv64_dtb_bytes.unwrap().as_slice());
-    assert_eq!(rv32_dtb.is_ok(), true);
-    assert_eq!(rv64_dtb.is_ok(), true);
+        let dtb = DeviceTreeBlob::from_slice(bytes.unwrap().as_slice());
+        assert_eq!(dtb.is_ok(), true);
 
-    /* now parse them again from DTB to trees to test our DTB generation code is sound */
-    let rv32_parsed = rv32_dtb.unwrap().to_parsed();
-    let rv64_parsed = rv64_dtb.unwrap().to_parsed();
-    assert_eq!(rv32_parsed.is_ok(), true);
-    assert_eq!(rv64_parsed.is_ok(), true);
+        /* now parse them again from DTB to trees to test our DTB generation code is sound */
+        let parsed = dtb.unwrap().to_parsed();
+        assert_eq!(parsed.is_ok(), true);
 
-    let rv32_parsed = rv32_parsed.unwrap();
-    let rv64_parsed = rv64_parsed.unwrap();
+        let parsed = parsed.unwrap();
 
-    /* perform checks */
-    /* should be two CPU cores each */
-    assert!(count_cpu_cores(&rv32_parsed) == 2);
-    assert!(count_cpu_cores(&rv64_parsed) == 2);
-    /* should be 128MiB of RAM each */
-    assert!(count_ram(&rv32_parsed) == 128 * 1024 * 1024);
-    assert!(count_ram(&rv64_parsed) == 128 * 1024 * 1024);
-    /* stdout should point to a serial device */
-    assert!(check_stdout(&rv32_parsed));
-    assert!(check_stdout(&rv64_parsed));
+        /* perform checks */
+        /* should be two CPU cores each */
+        assert!(count_cpu_cores(&parsed) == tree.cpus);
+
+        /* should be 128MiB of RAM each */
+        assert!(count_ram(&parsed) == tree.ram_size);
+
+        /* stdout should point to a serial device */
+        assert!(check_stdout(&parsed));
+    }
 }
